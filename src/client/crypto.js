@@ -59,22 +59,39 @@ function hkdfSha512(ikm, info, length, salt = Buffer.alloc(64, 0)) {
   return Buffer.concat(output).subarray(0, length);
 }
 
-function computeRouteTag(rootKey, counter = 0, direction = 'send', index = 0) {
+function computeRouteTag(rootKey, counter = 0, direction = 'send', index = 0, routeTagEpoch) {
   if (direction !== 'send' && direction !== 'receive') {
     throw new Error('Route tag direction must be send or receive');
   }
   if (!Number.isSafeInteger(index) || index < 0) {
     throw new Error('Route tag index must be a non-negative integer');
   }
+  const chunks = [
+    toBuffer(rootKey),
+    Buffer.from([0]),
+    encodeCounter(counter),
+    Buffer.from([0]),
+    Buffer.from(direction),
+    Buffer.from([0]),
+    encodeCounter(index),
+  ];
+  if (routeTagEpoch !== undefined && routeTagEpoch !== null) {
+    chunks.push(Buffer.from([0]), toBuffer(routeTagEpoch));
+  }
+  return createHash('sha512').update(Buffer.concat(chunks)).digest('hex');
+}
+
+function deriveRouteTagEpoch(rootKey, epochCounter = 0) {
+  if (!Number.isSafeInteger(epochCounter) || epochCounter < 0) {
+    throw new Error('Route tag epoch counter must be a non-negative integer');
+  }
   return createHash('sha512')
     .update(Buffer.concat([
       toBuffer(rootKey),
       Buffer.from([0]),
-      encodeCounter(counter),
+      Buffer.from('route-tag-epoch'),
       Buffer.from([0]),
-      Buffer.from(direction),
-      Buffer.from([0]),
-      encodeCounter(index),
+      encodeCounter(epochCounter),
     ]))
     .digest('hex');
 }
@@ -277,6 +294,7 @@ function verifyMessage(identityPublicKeyPem, messageObject, signature) {
 module.exports = {
   sha512,
   computeRouteTag,
+  deriveRouteTagEpoch,
   hkdfSha512,
   deriveInitialRootAndChainKeys,
   deriveRootAndChainFromDh,

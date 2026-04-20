@@ -14,6 +14,7 @@ const {
 } = require('./identity');
 const {
   computeRouteTag,
+  deriveRouteTagEpoch,
   signMessage,
   verifyMessage,
   deriveSharedSecret,
@@ -47,6 +48,12 @@ const DEFAULT_PARALLEL_ROUTE_TAGS = 4;
 const DEFAULT_PULL_NOISE_LEVEL = 6;
 const DEFAULT_PULL_INTERVAL_JITTER_MS = 250;
 const DEFAULT_RATE_SHAPING = { minMessagesPerSecond: 0.2, maxMessagesPerSecond: 5 };
+const DEFAULT_CONSTANT_TRAFFIC_RATE_PER_SECOND = 2;
+const DEFAULT_ROUTE_TAG_EPOCH_MESSAGES = 32;
+const DEFAULT_MIXING_DELAY_RANGE_MS = { min: 0, max: 0 };
+const DEFAULT_INBOUND_DELAY_RANGE_MS = { min: 5, max: 35 };
+const DEFAULT_SMOOTHING_WINDOW_MS = 5_000;
+const DEFAULT_SMOOTHING_VARIANCE = 0.15;
 
 function normalizeRange(range, fallback) {
   const min = Number(range?.min ?? fallback.min);
@@ -86,6 +93,15 @@ class SecureClient {
     pullNoiseLevel = DEFAULT_PULL_NOISE_LEVEL,
     pullIntervalJitterMs = DEFAULT_PULL_INTERVAL_JITTER_MS,
     rateShaping = DEFAULT_RATE_SHAPING,
+    constantTrafficEnabled = false,
+    constantTrafficRatePerSecond = DEFAULT_CONSTANT_TRAFFIC_RATE_PER_SECOND,
+    routeTagEpochMessages = DEFAULT_ROUTE_TAG_EPOCH_MESSAGES,
+    outboundMixDelayRangeMs = DEFAULT_MIXING_DELAY_RANGE_MS,
+    inboundProcessDelayRangeMs = DEFAULT_INBOUND_DELAY_RANGE_MS,
+    trafficSmoothingWindowMs = DEFAULT_SMOOTHING_WINDOW_MS,
+    trafficSmoothingVariance = DEFAULT_SMOOTHING_VARIANCE,
+    normalizedPullRouteTagCount,
+    decoySessionCount = 0,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -112,6 +128,40 @@ class SecureClient {
     this.parallelRouteTags = Math.max(1, Number(parallelRouteTags) || DEFAULT_PARALLEL_ROUTE_TAGS);
     this.pullNoiseLevel = Math.max(0, Number(pullNoiseLevel) || 0);
     this.pullIntervalJitterMs = Math.max(0, Number(pullIntervalJitterMs) || 0);
+    this.constantTrafficEnabled = Boolean(constantTrafficEnabled);
+    this.constantTrafficRatePerSecond = Math.max(
+      0.1,
+      Number(constantTrafficRatePerSecond) || DEFAULT_CONSTANT_TRAFFIC_RATE_PER_SECOND,
+    );
+    this.routeTagEpochMessages = Math.max(
+      1,
+      Number(routeTagEpochMessages) || DEFAULT_ROUTE_TAG_EPOCH_MESSAGES,
+    );
+    this.outboundMixDelayRangeMs = normalizeRange(
+      outboundMixDelayRangeMs,
+      DEFAULT_MIXING_DELAY_RANGE_MS,
+    );
+    this.inboundProcessDelayRangeMs = normalizeRange(
+      inboundProcessDelayRangeMs,
+      DEFAULT_INBOUND_DELAY_RANGE_MS,
+    );
+    this.trafficSmoothingWindowMs = Math.max(
+      250,
+      Number(trafficSmoothingWindowMs) || DEFAULT_SMOOTHING_WINDOW_MS,
+    );
+    this.trafficSmoothingVariance = Math.min(
+      0.45,
+      Math.max(0.01, Number(trafficSmoothingVariance) || DEFAULT_SMOOTHING_VARIANCE),
+    );
+    const normalizedPullCount = Number(normalizedPullRouteTagCount);
+    this.normalizedPullRouteTagCount = Math.max(
+      1,
+      Math.min(
+        this.maxPullRouteTags,
+        Number.isFinite(normalizedPullCount) ? normalizedPullCount : this.maxPullRouteTags,
+      ),
+    );
+    this.decoySessionCount = Math.max(0, Number(decoySessionCount) || 0);
 
     const minMessagesPerSecond = Number(rateShaping?.minMessagesPerSecond);
     const maxMessagesPerSecond = Number(rateShaping?.maxMessagesPerSecond);
@@ -129,6 +179,12 @@ class SecureClient {
     this.outboundQueue = [];
     this.outboundFlushTimer = null;
     this.lastOutboundSentAt = 0;
+    this.outboundSequence = 0;
+    this.constantTrafficTimer = null;
+    this.lastTrafficSlotScheduledAt = 0;
+    this.sentTrafficTimestamps = [];
+    this.dummySessionRoundRobin = 0;
+    this.decoyRouteSecrets = [];
     this.coverTrafficTimer = null;
     this.coverTrafficEnabled = false;
     this.autoPullTimer = null;
@@ -179,11 +235,21 @@ class SecureClient {
   }
 
   getMinSendIntervalMs() {
+    if (this.constantTrafficEnabled) {
+      return this.getBaseTrafficSlotIntervalMs();
+    }
     return Math.max(0, Math.floor(1_000 / this.rateShaping.maxMessagesPerSecond));
   }
 
   getMaxSendIntervalMs() {
+    if (this.constantTrafficEnabled) {
+      return this.getBaseTrafficSlotIntervalMs();
+    }
     return Math.max(0, Math.floor(1_000 / this.rateShaping.minMessagesPerSecond));
+  }
+
+  getBaseTrafficSlotIntervalMs() {
+    return Math.max(1, Math.floor(1_000 / this.constantTrafficRatePerSecond));
   }
 
   computeQueueDelayMs() {
@@ -194,10 +260,29 @@ class SecureClient {
     return randomInt(0, this.parallelRouteTags);
   }
 
+  getRouteTagEpochCounter(counter) {
+    return Math.floor(counter / this.routeTagEpochMessages);
+  }
+
+  deriveRouteTagEpochForCounter(session, counter) {
+    return deriveRouteTagEpoch(session.rootKey, this.getRouteTagEpochCounter(counter));
+  }
+
+  computeRouteTagForSession(session, counter, direction = 'send', index = this.pickRouteTagIndex()) {
+    return computeRouteTag(
+      session.rootKey,
+      counter,
+      direction,
+      index,
+      this.deriveRouteTagEpochForCounter(session, counter),
+    );
+  }
+
   computeRouteTagCandidates(rootKey, counter, direction = 'send') {
     const tags = [];
+    const routeTagEpoch = deriveRouteTagEpoch(rootKey, this.getRouteTagEpochCounter(counter));
     for (let index = 0; index < this.parallelRouteTags; index += 1) {
-      tags.push(computeRouteTag(rootKey, counter, direction, index));
+      tags.push(computeRouteTag(rootKey, counter, direction, index, routeTagEpoch));
     }
     return tags;
   }
@@ -327,10 +412,23 @@ class SecureClient {
       currentReceiveDhKey: peerDevicePublicKey,
       ratchetPending: false,
       expiresAt: now + this.sessionTtlMs,
+      isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith('_decoy_session:'),
     };
 
     this.sessions.set(sessionId, session);
     return session;
+  }
+
+  ensureDecoySessions() {
+    if (!this.decoySessionCount) {
+      return;
+    }
+    while (this.decoyRouteSecrets.length < this.decoySessionCount) {
+      const routeSecret = `decoy:${this.identity.deviceId}:${randomUUID()}`;
+      const peerDeviceId = `_decoy_session:${this.decoyRouteSecrets.length}:${routeSecret}`;
+      this.ensureSession({ routeSecret, peerDeviceId });
+      this.decoyRouteSecrets.push(routeSecret);
+    }
   }
 
   pruneSeenMessageIds(seenMessageIds) {
@@ -432,7 +530,7 @@ class SecureClient {
     const counter = session.sendCounter;
     const previousCounter = session.previousCounter;
     const dhPublicKey = session.selfDHKeyPair.publicKey;
-    const routeTag = computeRouteTag(session.rootKey, counter, 'send', this.pickRouteTagIndex());
+    const routeTag = this.computeRouteTagForSession(session, counter, 'send', this.pickRouteTagIndex());
     const messageKey = deriveMessageKey(session.chainKeySend);
     const encrypted = encryptPayloadWithMessageKey(
       { content, attachments, isDummy: false },
@@ -458,16 +556,30 @@ class SecureClient {
 
     const signature = signMessage(this.identity.identityKeyPair.privateKey, baseMessage);
     const envelope = { ...baseMessage, signature };
-    this.queueOutboundMessage(envelope);
+    this.queueOutboundMessage(envelope, { sessionId: this.getSessionId({ peerDeviceId: recipientDeviceId, peerDevicePublicKey: recipientDevicePublicKey, routeSecret }) });
     return envelope;
   }
 
-  queueOutboundMessage(message) {
-    this.outboundQueue.push(message);
+  computeMixDelayMs() {
+    return this.randomInRange(this.outboundMixDelayRangeMs);
+  }
+
+  queueOutboundMessage(message, { sessionId = message?.sessionId || 'default', isDummy = false } = {}) {
+    this.outboundQueue.push({
+      message,
+      sessionId,
+      isDummy,
+      queuedAt: Date.now(),
+      releaseAt: Date.now() + this.computeMixDelayMs(),
+      sequence: this.outboundSequence++,
+    });
     this.scheduleOutboundFlush();
   }
 
   scheduleOutboundFlush(delayMs = this.computeQueueDelayMs()) {
+    if (this.constantTrafficEnabled) {
+      return;
+    }
     if (this.outboundFlushTimer) {
       return;
     }
@@ -486,6 +598,9 @@ class SecureClient {
     if (!this.outboundQueue.length) {
       return;
     }
+    if (this.constantTrafficEnabled) {
+      return;
+    }
 
     const now = Date.now();
     const minIntervalMs = this.getMinSendIntervalMs();
@@ -497,14 +612,150 @@ class SecureClient {
       }
     }
 
-    const batch = this.outboundQueue.splice(0, this.outboundQueue.length);
-    for (const message of batch) {
-      this.sendRaw(message);
+    const ready = this.outboundQueue
+      .filter((entry) => entry.releaseAt <= now)
+      .sort((a, b) => a.sequence - b.sequence);
+    if (!ready.length) {
+      const nextReadyAt = Math.min(...this.outboundQueue.map((entry) => entry.releaseAt));
+      this.scheduleOutboundFlush(Math.max(1, nextReadyAt - now));
+      return;
+    }
+
+    for (const entry of ready) {
+      this.sendRaw(entry.message);
+      const index = this.outboundQueue.findIndex((candidate) => candidate.sequence === entry.sequence);
+      if (index >= 0) {
+        this.outboundQueue.splice(index, 1);
+      }
     }
     this.lastOutboundSentAt = Date.now();
 
     if (this.outboundQueue.length) {
       this.scheduleOutboundFlush(this.getMinSendIntervalMs());
+    }
+  }
+
+  pickRandomSession(values) {
+    if (!values.length) {
+      return null;
+    }
+    const index = randomInt(0, values.length);
+    return values[index];
+  }
+
+  pickReadyPerSessionHeads(now = Date.now()) {
+    const headBySession = new Map();
+    for (const entry of this.outboundQueue.sort((a, b) => a.sequence - b.sequence)) {
+      if (!headBySession.has(entry.sessionId)) {
+        headBySession.set(entry.sessionId, entry);
+      }
+    }
+    const heads = [...headBySession.values()];
+    const readyHeads = heads.filter((entry) => entry.releaseAt <= now);
+    return readyHeads.length ? readyHeads : heads;
+  }
+
+  popOutboundEntryBySequence(sequence) {
+    const index = this.outboundQueue.findIndex((entry) => entry.sequence === sequence);
+    if (index < 0) {
+      return null;
+    }
+    const [entry] = this.outboundQueue.splice(index, 1);
+    return entry;
+  }
+
+  selectSessionForDummy() {
+    const sessions = [...this.sessions.entries()]
+      .filter(([, session]) => session && session.rootKey && session.selfDHKeyPair?.publicKey);
+    if (!sessions.length) {
+      return null;
+    }
+    const index = this.dummySessionRoundRobin % sessions.length;
+    this.dummySessionRoundRobin += 1;
+    return sessions[index];
+  }
+
+  queueDummyForTrafficSlot() {
+    const selected = this.selectSessionForDummy();
+    if (!selected) {
+      return;
+    }
+    const [sessionId, session] = selected;
+    const envelope = this.createDummyEnvelopeForSession(session);
+    this.queueOutboundMessage(envelope, { sessionId, isDummy: true });
+  }
+
+  calculateSmoothingAdjustedInterval(baseIntervalMs) {
+    const now = Date.now();
+    this.sentTrafficTimestamps = this.sentTrafficTimestamps
+      .filter((timestamp) => now - timestamp <= this.trafficSmoothingWindowMs);
+
+    const expectedInWindow = (this.trafficSmoothingWindowMs / 1_000) * this.constantTrafficRatePerSecond;
+    const lowerBound = expectedInWindow * (1 - this.trafficSmoothingVariance);
+    const upperBound = expectedInWindow * (1 + this.trafficSmoothingVariance);
+    const observed = this.sentTrafficTimestamps.length;
+
+    if (observed > upperBound) {
+      return Math.ceil(baseIntervalMs * 1.2);
+    }
+    if (observed < lowerBound) {
+      return Math.max(1, Math.floor(baseIntervalMs * 0.85));
+    }
+    return baseIntervalMs;
+  }
+
+  sendConstantTrafficSlot() {
+    if (!this.constantTrafficEnabled) {
+      return;
+    }
+
+    if (!this.outboundQueue.length) {
+      this.queueDummyForTrafficSlot();
+    }
+
+    const candidates = this.pickReadyPerSessionHeads(Date.now());
+    if (!candidates.length) {
+      return;
+    }
+
+    const picked = this.pickRandomSession(candidates);
+    const entry = this.popOutboundEntryBySequence(picked.sequence);
+    if (!entry) {
+      return;
+    }
+
+    this.sendRaw(entry.message);
+    const now = Date.now();
+    this.lastOutboundSentAt = now;
+    this.sentTrafficTimestamps.push(now);
+  }
+
+  scheduleNextConstantTrafficSlot() {
+    if (!this.constantTrafficEnabled) {
+      return;
+    }
+    const baseInterval = this.getBaseTrafficSlotIntervalMs();
+    const smoothedInterval = this.calculateSmoothingAdjustedInterval(baseInterval);
+    this.constantTrafficTimer = setTimeout(() => {
+      this.constantTrafficTimer = null;
+      this.sendConstantTrafficSlot();
+      this.scheduleNextConstantTrafficSlot();
+    }, smoothedInterval);
+  }
+
+  startConstantTrafficLoop() {
+    if (!this.constantTrafficEnabled || this.constantTrafficTimer) {
+      return;
+    }
+    this.ensureDecoySessions();
+    this.sendConstantTrafficSlot();
+    this.scheduleNextConstantTrafficSlot();
+  }
+
+  stopConstantTrafficLoop() {
+    if (this.constantTrafficTimer) {
+      clearTimeout(this.constantTrafficTimer);
+      this.constantTrafficTimer = null;
     }
   }
 
@@ -514,7 +765,7 @@ class SecureClient {
     const counter = session.sendCounter;
     const previousCounter = session.previousCounter;
     const dhPublicKey = session.selfDHKeyPair.publicKey;
-    const routeTag = computeRouteTag(session.rootKey, counter, 'send', this.pickRouteTagIndex());
+    const routeTag = this.computeRouteTagForSession(session, counter, 'send', this.pickRouteTagIndex());
     const messageKey = deriveMessageKey(session.chainKeySend);
     const encrypted = encryptPayloadWithMessageKey(
       { content: '', attachments: undefined, isDummy: true },
@@ -542,12 +793,7 @@ class SecureClient {
   }
 
   sendDummyTraffic() {
-    for (const session of this.sessions.values()) {
-      if (!session || !session.rootKey || !session.selfDHKeyPair?.publicKey) {
-        continue;
-      }
-      this.queueOutboundMessage(this.createDummyEnvelopeForSession(session));
-    }
+    this.queueDummyForTrafficSlot();
   }
 
   scheduleNextCoverTraffic() {
@@ -569,11 +815,17 @@ class SecureClient {
       return;
     }
     this.coverTrafficEnabled = true;
+    this.ensureDecoySessions();
+    if (this.constantTrafficEnabled) {
+      this.startConstantTrafficLoop();
+      return;
+    }
     this.scheduleNextCoverTraffic();
   }
 
   stopCoverTraffic() {
     this.coverTrafficEnabled = false;
+    this.stopConstantTrafficLoop();
     if (this.coverTrafficTimer) {
       clearTimeout(this.coverTrafficTimer);
       this.coverTrafficTimer = null;
@@ -667,16 +919,36 @@ class SecureClient {
     return payload;
   }
 
+  delayInboundProcessing(task, { min, max } = this.inboundProcessDelayRangeMs) {
+    const range = normalizeRange({ min, max }, this.inboundProcessDelayRangeMs);
+    const delayMs = this.randomInRange(range);
+    return new Promise((resolve, reject) => {
+      setTimeout(() => {
+        try {
+          resolve(task());
+        } catch (error) {
+          reject(error);
+        }
+      }, delayMs);
+    });
+  }
+
+  decryptChatWithDelay(params) {
+    return this.delayInboundProcessing(() => this.decryptChat(params));
+  }
+
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
     const boundedWindow = Math.max(0, Math.min(window, this.maxPullWindow));
+    const effectiveRouteSecrets = [...new Set([...routeSecrets, ...this.decoyRouteSecrets])];
     const routeTags = [];
-    for (const routeSecret of routeSecrets) {
+    for (const routeSecret of effectiveRouteSecrets) {
       const session = this.ensureSession({ routeSecret, peerDeviceId: `_route_session:${routeSecret}` });
       const start = Math.max(0, session.receiveCounter - boundedWindow);
       const end = session.receiveCounter + boundedWindow;
       for (let counter = start; counter <= end; counter += 1) {
+        const routeTagEpoch = this.deriveRouteTagEpochForCounter(session, counter);
         for (let index = 0; index < this.parallelRouteTags; index += 1) {
-          routeTags.push(computeRouteTag(session.rootKey, counter, 'send', index));
+          routeTags.push(computeRouteTag(session.rootKey, counter, 'send', index, routeTagEpoch));
           if (routeTags.length >= this.maxPullRouteTags) {
             break;
           }
@@ -691,24 +963,32 @@ class SecureClient {
     }
 
     let referenceCounter = 0;
-    if (routeSecrets.length) {
+    if (effectiveRouteSecrets.length) {
       const referenceSession = this.ensureSession({
-        routeSecret: routeSecrets[0],
-        peerDeviceId: `_route_session:${routeSecrets[0]}`,
+        routeSecret: effectiveRouteSecrets[0],
+        peerDeviceId: `_route_session:${effectiveRouteSecrets[0]}`,
       });
       referenceCounter = referenceSession.receiveCounter;
     }
     const noiseStart = Math.max(0, referenceCounter - boundedWindow);
     const noiseEnd = referenceCounter + boundedWindow;
-    const noiseToAdd = Math.min(this.pullNoiseLevel, Math.max(0, this.maxPullRouteTags - routeTags.length));
+    const pullTargetCount = Math.min(this.maxPullRouteTags, this.normalizedPullRouteTagCount);
+    const noiseToAdd = Math.max(0, pullTargetCount - routeTags.length);
     for (let i = 0; i < noiseToAdd; i += 1) {
       const noiseRoot = createHash('sha512')
         .update(`${this.pullNoiseSeed}:${this.pullNoiseCounter++}`)
         .digest('hex');
       const noiseCounter = noiseStart + randomInt(0, Math.max(1, noiseEnd - noiseStart + 1));
       const noiseIndex = randomInt(0, this.parallelRouteTags);
-      routeTags.push(computeRouteTag(noiseRoot, noiseCounter, 'send', noiseIndex));
+      routeTags.push(computeRouteTag(
+        noiseRoot,
+        noiseCounter,
+        'send',
+        noiseIndex,
+        deriveRouteTagEpoch(noiseRoot, this.getRouteTagEpochCounter(noiseCounter)),
+      ));
     }
+    const normalizedTags = shuffleInPlace(routeTags).slice(0, pullTargetCount);
 
     this.sendRaw({
       type: 'control',
@@ -716,11 +996,12 @@ class SecureClient {
       encryptedPayload: '',
       timestamp: Date.now(),
       action: 'pull',
-      routeTags: shuffleInPlace(routeTags),
+      routeTags: normalizedTags,
     });
   }
 
   startAutoPull(routeSecrets = [], { intervalMs = 2_000, window = this.receiveWindow } = {}) {
+    this.ensureDecoySessions();
     this.autoPullActive = true;
     this.autoPullRouteSecrets = [...routeSecrets];
     this.autoPullBaseIntervalMs = Math.max(0, Number(intervalMs) || 0);
