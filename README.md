@@ -1,4 +1,4 @@
-# sekure
+# secure-chat
 
 Privacy-first self-hosted communication baseline implementation.
 
@@ -19,9 +19,9 @@ npm run start:server
 
 Config via env vars:
 
-- `SEKURE_RELAY_HOST` (default `0.0.0.0`)
-- `SEKURE_RELAY_PORT` (default `8080`)
-- `SEKURE_RELAY_TTL_MS` (default `60000`)
+- `SECURE_RELAY_HOST` (default `0.0.0.0`, falls back to `SEKURE_RELAY_HOST`)
+- `SECURE_RELAY_PORT` (default `8080`, falls back to `SEKURE_RELAY_PORT`)
+- `SECURE_RELAY_TTL_MS` (default `60000`, falls back to `SEKURE_RELAY_TTL_MS`)
 
 ## Run tests
 

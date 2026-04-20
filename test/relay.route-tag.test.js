@@ -31,13 +31,17 @@ test('receiver can pull buffered chat by routeTag', async () => {
     timestamp: Date.now(),
   })}\n`);
 
-  const routeTag = computeRouteTag('shared-route-secret');
+  const routeTag = computeRouteTag('shared-route-secret', 0);
+  const messageId = 'message-1';
   sender.send(`${JSON.stringify({
     type: 'chat',
     senderDeviceId: 'sender-1',
     routeTag,
+    messageId,
+    counter: 0,
     encryptedPayload: 'ciphertext',
     timestamp: Date.now(),
+    signature: 'sig',
   })}\n`);
 
   const receiver = await openSocket(`ws://127.0.0.1:${port}`);

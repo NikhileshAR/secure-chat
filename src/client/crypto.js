@@ -4,7 +4,6 @@ const {
   createPublicKey,
   createPrivateKey,
   diffieHellman,
-  randomBytes,
   createCipheriv,
   createDecipheriv,
   sign,
@@ -15,8 +14,17 @@ function sha512(input) {
   return createHash('sha512').update(input).digest('hex');
 }
 
-function computeRouteTag(sharedSecret) {
-  return sha512(`route:${sharedSecret}`);
+function toBuffer(value) {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  return Buffer.from(String(value));
+}
+
+function computeRouteTag(sharedSecret, counter = 0) {
+  return createHash('sha512')
+    .update(Buffer.concat([toBuffer(sharedSecret), Buffer.from(String(counter))]))
+    .digest('hex');
 }
 
 function hkdfSha512(ikm, info, length) {
@@ -58,19 +66,15 @@ function decryptAesGcm(payload, key) {
 }
 
 function encryptPayload(payload, senderDevicePrivateKeyPem, recipientDevicePublicKeyPem) {
-  const sessionKey = randomBytes(32);
   const payloadBytes = Buffer.from(JSON.stringify(payload));
-  const encryptedPayload = encryptAesGcm(payloadBytes, sessionKey);
-
   const recipientPublicKey = createPublicKey(recipientDevicePublicKeyPem);
   const senderPrivateKey = createPrivateKey(senderDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: senderPrivateKey, publicKey: recipientPublicKey });
-  const wrappingKey = hkdfSha512(sharedSecret, 'secure-session-wrap', 32);
-  const encryptedSessionKey = encryptAesGcm(sessionKey, wrappingKey);
+  const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', 32);
+  const encryptedPayload = encryptAesGcm(payloadBytes, messageKey);
 
   return {
     encryptedPayload,
-    encryptedSessionKey,
   };
 }
 
@@ -78,10 +82,39 @@ function decryptPayload(encryptedMessage, recipientDevicePrivateKeyPem, senderDe
   const senderPublicKey = createPublicKey(senderDevicePublicKeyPem);
   const recipientPrivateKey = createPrivateKey(recipientDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: recipientPrivateKey, publicKey: senderPublicKey });
-  const wrappingKey = hkdfSha512(sharedSecret, 'secure-session-wrap', 32);
-  const sessionKey = decryptAesGcm(encryptedMessage.encryptedSessionKey, wrappingKey);
-  const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, sessionKey);
+  const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', 32);
+  const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, messageKey);
   return JSON.parse(decryptedPayload.toString('utf8'));
+}
+
+function encryptPayloadWithMessageKey(payload, messageKey) {
+  const payloadBytes = Buffer.from(JSON.stringify(payload));
+  return {
+    encryptedPayload: encryptAesGcm(payloadBytes, messageKey),
+  };
+}
+
+function decryptPayloadWithMessageKey(encryptedMessage, messageKey) {
+  const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, messageKey);
+  return JSON.parse(decryptedPayload.toString('utf8'));
+}
+
+function deriveSharedSecret(senderDevicePrivateKeyPem, recipientDevicePublicKeyPem) {
+  const recipientPublicKey = createPublicKey(recipientDevicePublicKeyPem);
+  const senderPrivateKey = createPrivateKey(senderDevicePrivateKeyPem);
+  return diffieHellman({ privateKey: senderPrivateKey, publicKey: recipientPublicKey });
+}
+
+function deriveInitialChainKey(sharedSecret) {
+  return hkdfSha512(toBuffer(sharedSecret), 'secure-chain-key', 64);
+}
+
+function deriveMessageKey(chainKey) {
+  return createHmac('sha512', toBuffer(chainKey)).update('msg').digest().subarray(0, 32);
+}
+
+function deriveNextChainKey(chainKey) {
+  return createHmac('sha512', toBuffer(chainKey)).update('chain').digest();
 }
 
 function signMessage(identityPrivateKeyPem, messageObject) {
@@ -99,6 +132,12 @@ module.exports = {
   computeRouteTag,
   encryptPayload,
   decryptPayload,
+  encryptPayloadWithMessageKey,
+  decryptPayloadWithMessageKey,
+  deriveSharedSecret,
+  deriveInitialChainKey,
+  deriveMessageKey,
+  deriveNextChainKey,
   signMessage,
   verifyMessage,
 };
