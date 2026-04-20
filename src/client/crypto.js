@@ -25,13 +25,13 @@ function toBuffer(value) {
     return value;
   }
   if (value === undefined || value === null) {
-    throw new Error('Value is required');
+    throw new Error('toBuffer: value cannot be null or undefined');
   }
   return Buffer.from(String(value));
 }
 
 function encodeCounter(counter) {
-  if (!Number.isInteger(counter) || counter < 0) {
+  if (!Number.isSafeInteger(counter) || counter < 0) {
     throw new Error('Counter must be a non-negative integer');
   }
   const counterBuffer = Buffer.alloc(ROUTE_COUNTER_SIZE);
@@ -85,10 +85,7 @@ function deriveInitialRootAndChainKeys(sharedSecret, isInitiator = true) {
   };
 }
 
-function deriveRootAndChainFromDh(rootKey, dhSharedSecret, directionLabel = 'step') {
-  if (!directionLabel) {
-    throw new Error('directionLabel is required');
-  }
+function deriveRootAndChainFromDh(rootKey, dhSharedSecret) {
   const material = hkdfSha512(
     toBuffer(dhSharedSecret),
     'secure-double-ratchet-step',

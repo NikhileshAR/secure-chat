@@ -210,7 +210,6 @@ class SecureClient {
       receiveCounter: 0,
       previousCounter: 0,
       skippedMessageKeys: new Map(),
-      pendingReceiveKeys: null,
       seenMessageIds: new Map(),
       lastDHKey: peerDevicePublicKey,
       selfDHKeyPair: this.identity.deviceKeyPair,
@@ -218,7 +217,6 @@ class SecureClient {
       ratchetPending: false,
       expiresAt: now + this.sessionTtlMs,
     };
-    session.pendingReceiveKeys = session.skippedMessageKeys;
 
     this.sessions.set(sessionId, session);
     return session;
@@ -234,7 +232,7 @@ class SecureClient {
   }
 
   makeSkippedKeyId(dhPublicKey, counter) {
-    return `${dhPublicKey}:${counter}`;
+    return JSON.stringify([dhPublicKey, counter]);
   }
 
   pruneSkippedMessageKeys(session) {
@@ -272,7 +270,7 @@ class SecureClient {
 
     const newDhKeyPair = this.createDhKeyPair();
     const newSharedSecret = deriveSharedSecret(newDhKeyPair.privateKey, session.lastDHKey);
-    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret, 'send');
+    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
 
     session.previousCounter = session.sendCounter;
     session.sendCounter = 0;
@@ -358,7 +356,7 @@ class SecureClient {
     }
 
     const newSharedSecret = deriveSharedSecret(session.selfDHKeyPair.privateKey, incomingDhPublicKey);
-    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret, 'receive');
+    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
     session.rootKey = Buffer.from(next.rootKey);
     session.chainKeyReceive = Buffer.from(next.chainKey);
     session.receiveCounter = 0;
