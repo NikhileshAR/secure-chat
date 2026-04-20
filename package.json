@@ -1,0 +1,25 @@
+{
+  "name": "sekure",
+  "version": "1.0.0",
+  "description": "Privacy-first self-hosted communication baseline",
+  "main": "src/client/client.js",
+  "scripts": {
+    "test": "node --test",
+    "start:server": "node src/server/relayServer.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NikhileshAR/sekure.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/NikhileshAR/sekure/issues"
+  },
+  "homepage": "https://github.com/NikhileshAR/sekure#readme",
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
