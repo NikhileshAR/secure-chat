@@ -83,14 +83,22 @@ test('decryptChat drops replayed message ids and handles out-of-order counters',
     senderIdentityPublicKey: aliceIdentity.identityKeyPair.publicKey,
     routeSecret: 'shared-route-secret',
   });
-  const replay = bob.decryptChat({
-    message: sent[0],
-    senderDevicePublicKey: aliceIdentity.deviceKeyPair.publicKey,
-    senderIdentityPublicKey: aliceIdentity.identityKeyPair.publicKey,
-    routeSecret: 'shared-route-secret',
+  const session = bob.sessions.get(aliceIdentity.deviceId);
+  const beforeReceiveCounter = session.receiveCounter;
+  const beforePendingSize = session.pendingReceiveKeys.size;
+  let replay = 'unset';
+  assert.doesNotThrow(() => {
+    replay = bob.decryptChat({
+      message: sent[0],
+      senderDevicePublicKey: aliceIdentity.deviceKeyPair.publicKey,
+      senderIdentityPublicKey: aliceIdentity.identityKeyPair.publicKey,
+      routeSecret: 'shared-route-secret',
+    });
   });
 
   assert.equal(second.content, 'second');
   assert.equal(first.content, 'first');
   assert.equal(replay, null);
+  assert.equal(session.receiveCounter, beforeReceiveCounter);
+  assert.equal(session.pendingReceiveKeys.size, beforePendingSize);
 });

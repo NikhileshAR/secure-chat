@@ -15,13 +15,21 @@ const {
 } = require('./crypto');
 
 class SecureClient {
-  constructor({ serverUrl, identity = generateIdentity(), postQuantumPublicKey, replayTtlMs = 120_000, receiveWindow = 10 }) {
+  constructor({
+    serverUrl,
+    identity = generateIdentity(),
+    postQuantumPublicKey,
+    replayTtlMs = 120_000,
+    receiveWindow = 10,
+    maxPendingReceiveKeys = 256,
+  }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
     this.postQuantumPublicKey = postQuantumPublicKey || randomBytes(32).toString('base64');
     this.socket = null;
     this.replayTtlMs = replayTtlMs;
     this.receiveWindow = receiveWindow;
+    this.maxPendingReceiveKeys = maxPendingReceiveKeys;
     this.sessions = new Map();
   }
 
@@ -88,6 +96,23 @@ class SecureClient {
       if (expiresAt <= now) {
         seenMessageIds.delete(messageId);
       }
+    }
+  }
+
+  prunePendingReceiveKeys(session) {
+    const minLiveCounter = Math.max(0, session.receiveCounter - this.receiveWindow);
+    for (const counter of session.pendingReceiveKeys.keys()) {
+      if (counter < minLiveCounter) {
+        session.pendingReceiveKeys.delete(counter);
+      }
+    }
+    if (session.pendingReceiveKeys.size <= this.maxPendingReceiveKeys) {
+      return;
+    }
+    const counters = [...session.pendingReceiveKeys.keys()].sort((a, b) => a - b);
+    const removeCount = session.pendingReceiveKeys.size - this.maxPendingReceiveKeys;
+    for (let i = 0; i < removeCount; i += 1) {
+      session.pendingReceiveKeys.delete(counters[i]);
     }
   }
 
@@ -202,9 +227,9 @@ class SecureClient {
           session.pendingReceiveKeys.set(counter, derivedKey);
         }
       }
-
       session.chainKeyReceive = chainKey;
       session.receiveCounter = message.counter + 1;
+      this.prunePendingReceiveKeys(session);
     }
 
     return decryptPayloadWithMessageKey(JSON.parse(message.encryptedPayload), messageKey);
