@@ -4,7 +4,17 @@ const { SecureClient } = require('../src/client/client');
 const { generateIdentity } = require('../src/client/identity');
 
 function createClient(identity, options = {}) {
-  const client = new SecureClient({ serverUrl: 'ws://127.0.0.1:1', identity, ...options });
+  const client = new SecureClient({
+    serverUrl: 'ws://127.0.0.1:1',
+    identity,
+    sendDelayRangeMs: { min: 0, max: 0 },
+    batchingWindowMs: 0,
+    parallelRouteTags: 1,
+    pullNoiseLevel: 0,
+    coverTrafficIntervalRangeMs: { min: 60_000, max: 60_000 },
+    rateShaping: { minMessagesPerSecond: 1_000_000, maxMessagesPerSecond: 1_000_000 },
+    ...options,
+  });
   const sent = [];
   client.sendRaw = (message) => sent.push(message);
   return { client, sent };

@@ -13,6 +13,8 @@ class RelayServer {
     perDeviceRateLimit = { windowMs: 1_000, maxMessages: 120 },
     perRouteTagRateLimit = { windowMs: 1_000, maxMessages: 200 },
     connectionRateLimit = { windowMs: 1_000, maxMessages: 300 },
+    relayBatchSize = 50,
+    shuffleDelivery = true,
   } = {}) {
     this.host = host;
     this.port = port;
@@ -24,6 +26,8 @@ class RelayServer {
     this.perDeviceRateLimit = perDeviceRateLimit;
     this.perRouteTagRateLimit = perRouteTagRateLimit;
     this.connectionRateLimit = connectionRateLimit;
+    this.relayBatchSize = Math.max(1, Number(relayBatchSize) || 50);
+    this.shuffleDelivery = Boolean(shuffleDelivery);
 
     this.connections = new Map();
     this.routeStore = new Map();
@@ -201,13 +205,30 @@ class RelayServer {
       this.routeStore.delete(routeTag);
     }
 
-    socket.send(`${JSON.stringify({
-      type: 'control',
-      action: 'deliver',
-      encryptedPayload: JSON.stringify({ messages: matches }),
-      senderDeviceId: 'relay',
-      timestamp: Date.now(),
-    })}\n`);
+    if (this.shuffleDelivery && matches.length > 1) {
+      for (let i = matches.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [matches[i], matches[j]] = [matches[j], matches[i]];
+      }
+    }
+
+    const totalBatches = Math.max(1, Math.ceil(matches.length / this.relayBatchSize));
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+      const start = batchIndex * this.relayBatchSize;
+      const batchMessages = matches.slice(start, start + this.relayBatchSize);
+      socket.send(`${JSON.stringify({
+        type: 'control',
+        action: 'deliver',
+        encryptedPayload: JSON.stringify({
+          messages: batchMessages,
+          batchIndex,
+          totalBatches,
+          more: batchIndex < totalBatches - 1,
+        }),
+        senderDeviceId: 'relay',
+        timestamp: Date.now(),
+      })}\n`);
+    }
   }
 
   evictExpired() {

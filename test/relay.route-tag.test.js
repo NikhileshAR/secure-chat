@@ -18,6 +18,20 @@ function onceMessage(socket) {
   });
 }
 
+function collectMessages(socket, expectedCount) {
+  return new Promise((resolve) => {
+    const messages = [];
+    const listener = (data) => {
+      messages.push(data.toString());
+      if (messages.length >= expectedCount) {
+        socket.off('message', listener);
+        resolve(messages);
+      }
+    };
+    socket.on('message', listener);
+  });
+}
+
 test('receiver can pull buffered chat by routeTag', async () => {
   const port = 8900 + Math.floor(Math.random() * 200);
   const server = new RelayServer({ host: '127.0.0.1', port, messageTtlMs: 10_000 });
@@ -135,5 +149,78 @@ test('server enforces max message size', async () => {
   await closeWait;
 
   assert.equal(socket.readyState, socket.CLOSED);
+  server.stop();
+});
+
+test('relay delivers padded envelopes in shuffled/batched responses without decrypting payloads', async () => {
+  const port = 9700 + Math.floor(Math.random() * 200);
+  const server = new RelayServer({
+    host: '127.0.0.1',
+    port,
+    messageTtlMs: 10_000,
+    relayBatchSize: 2,
+    shuffleDelivery: true,
+  });
+  server.start();
+
+  const sender = await openSocket(`ws://127.0.0.1:${port}`);
+  sender.send(`${JSON.stringify({
+    type: 'handshake',
+    senderDeviceId: 'sender-batch',
+    encryptedPayload: '',
+    timestamp: Date.now(),
+  })}\n`);
+
+  const routeTag = computeRouteTag('shared-route-secret', 0);
+  for (let i = 0; i < 3; i += 1) {
+    sender.send(`${JSON.stringify({
+      type: 'chat',
+      senderDeviceId: 'sender-batch',
+      routeTag,
+      messageId: `message-${i}`,
+      counter: i,
+      encryptedPayload: JSON.stringify({
+        encryptedPayload: {
+          iv: 'AAAAAAAAAAAAAAAA',
+          ciphertext: Buffer.alloc(256, i).toString('base64'),
+          tag: 'AAAAAAAAAAAAAAAAAAAAAA==',
+        },
+      }),
+      timestamp: Date.now(),
+      signature: 'sig',
+    })}\n`);
+  }
+
+  const receiver = await openSocket(`ws://127.0.0.1:${port}`);
+  receiver.send(`${JSON.stringify({
+    type: 'handshake',
+    senderDeviceId: 'receiver-batch',
+    encryptedPayload: '',
+    timestamp: Date.now(),
+  })}\n`);
+
+  const responseWait = collectMessages(receiver, 2);
+  receiver.send(`${JSON.stringify({
+    type: 'control',
+    action: 'pull',
+    senderDeviceId: 'receiver-batch',
+    routeTags: [routeTag],
+    encryptedPayload: '',
+    timestamp: Date.now(),
+  })}\n`);
+
+  const responseMessages = await responseWait;
+  const decoded = responseMessages.map((raw) => JSON.parse(raw.trim()));
+  const payloads = decoded.map((message) => JSON.parse(message.encryptedPayload));
+  const delivered = payloads.flatMap((payload) => payload.messages);
+
+  assert.equal(decoded.every((message) => message.action === 'deliver'), true);
+  assert.equal(payloads[0].messages.length, 2);
+  assert.equal(payloads[1].messages.length, 1);
+  assert.equal(delivered.length, 3);
+  assert.equal(delivered.every((message) => typeof message.encryptedPayload === 'string'), true);
+
+  sender.close();
+  receiver.close();
   server.stop();
 });
