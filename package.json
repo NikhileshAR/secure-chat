@@ -1,5 +1,5 @@
 {
-  "name": "sekure",
+  "name": "secure-chat",
   "version": "1.0.0",
   "description": "Privacy-first self-hosted communication baseline",
   "main": "src/client/client.js",
@@ -9,16 +9,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NikhileshAR/sekure.git"
+    "url": "git+https://github.com/NikhileshAR/secure-chat.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/NikhileshAR/sekure/issues"
+    "url": "https://github.com/NikhileshAR/secure-chat/issues"
   },
-  "homepage": "https://github.com/NikhileshAR/sekure#readme",
+  "homepage": "https://github.com/NikhileshAR/secure-chat#readme",
   "dependencies": {
     "ws": "^8.20.0"
   }
