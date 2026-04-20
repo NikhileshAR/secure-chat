@@ -1,4 +1,12 @@
-const { generateKeyPairSync, randomUUID, sign, verify, createPrivateKey, createPublicKey } = require('node:crypto');
+const {
+  createHash,
+  generateKeyPairSync,
+  randomUUID,
+  sign,
+  verify,
+  createPrivateKey,
+  createPublicKey,
+} = require('node:crypto');
 
 function createSigningKeyPair() {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -14,6 +22,22 @@ function createDeviceKeyPair() {
     publicKey: publicKey.export({ type: 'spki', format: 'pem' }),
     privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }),
   };
+}
+
+function fingerprintIdentityPublicKey(identityPublicKeyPem) {
+  if (!identityPublicKeyPem) {
+    throw new Error('identityPublicKeyPem is required for fingerprinting');
+  }
+  return createHash('sha256').update(Buffer.from(identityPublicKeyPem)).digest('hex');
+}
+
+function formatIdentityFingerprint(identityPublicKeyPem, groupSize = 4) {
+  const fingerprint = fingerprintIdentityPublicKey(identityPublicKeyPem);
+  const groups = [];
+  for (let i = 0; i < fingerprint.length; i += groupSize) {
+    groups.push(fingerprint.slice(i, i + groupSize));
+  }
+  return groups.join(':');
 }
 
 function generateIdentity({ ttlMs } = {}) {
@@ -72,4 +96,6 @@ module.exports = {
   generateIdentity,
   rotateDeviceIdentity,
   verifyDeviceKeyBinding,
+  fingerprintIdentityPublicKey,
+  formatIdentityFingerprint,
 };

@@ -1,6 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { generateIdentity, rotateDeviceIdentity, verifyDeviceKeyBinding } = require('../src/client/identity');
+const {
+  generateIdentity,
+  rotateDeviceIdentity,
+  verifyDeviceKeyBinding,
+  fingerprintIdentityPublicKey,
+  formatIdentityFingerprint,
+} = require('../src/client/identity');
 const {
   computeRouteTag,
   encryptPayload,
@@ -48,10 +54,21 @@ test('route tags are deterministic per shared secret and counter', () => {
   const a = computeRouteTag('shared-secret', 3);
   const b = computeRouteTag('shared-secret', 3);
   const c = computeRouteTag('shared-secret', 4);
+  const d = computeRouteTag('shared-secret', 3, 'receive');
 
   assert.equal(a, b);
   assert.notEqual(a, c);
+  assert.notEqual(a, d);
   assert.equal(a.length, 128);
+});
+
+test('identity fingerprint is stable and display-friendly', () => {
+  const identity = generateIdentity();
+  const fingerprint = fingerprintIdentityPublicKey(identity.identityKeyPair.publicKey);
+  const displayed = formatIdentityFingerprint(identity.identityKeyPair.publicKey);
+
+  assert.equal(fingerprint.length, 64);
+  assert.match(displayed, /^[a-f0-9]{4}(:[a-f0-9]{4})+$/);
 });
 
 test('payload encrypted by sender can be decrypted by recipient only', () => {
