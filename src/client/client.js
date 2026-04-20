@@ -690,12 +690,22 @@ class SecureClient {
       }
     }
 
+    let referenceCounter = 0;
+    if (routeSecrets.length) {
+      const referenceSession = this.ensureSession({
+        routeSecret: routeSecrets[0],
+        peerDeviceId: `_route_session:${routeSecrets[0]}`,
+      });
+      referenceCounter = referenceSession.receiveCounter;
+    }
+    const noiseStart = Math.max(0, referenceCounter - boundedWindow);
+    const noiseEnd = referenceCounter + boundedWindow;
     const noiseToAdd = Math.min(this.pullNoiseLevel, Math.max(0, this.maxPullRouteTags - routeTags.length));
     for (let i = 0; i < noiseToAdd; i += 1) {
       const noiseRoot = createHash('sha512')
         .update(`${this.pullNoiseSeed}:${this.pullNoiseCounter++}`)
         .digest('hex');
-      const noiseCounter = randomInt(0, Math.max(1, boundedWindow + 1));
+      const noiseCounter = noiseStart + randomInt(0, Math.max(1, noiseEnd - noiseStart + 1));
       const noiseIndex = randomInt(0, this.parallelRouteTags);
       routeTags.push(computeRouteTag(noiseRoot, noiseCounter, 'send', noiseIndex));
     }

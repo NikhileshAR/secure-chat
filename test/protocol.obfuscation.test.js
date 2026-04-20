@@ -151,7 +151,7 @@ test('pull obfuscation adds noise tags without dropping expected tags', () => {
     routeSecret,
     peerDeviceId: `_route_session:${routeSecret}`,
   });
-  const expectedTag = computeRouteTag(session.rootKey, 0, 'send', 0);
+  const expectedTag = computeRouteTag(session.rootKey, session.receiveCounter, 'send', 0);
 
   client.pull([routeSecret], { window: 1 });
 
