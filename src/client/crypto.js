@@ -65,7 +65,7 @@ function encryptPayload(payload, senderDevicePrivateKeyPem, recipientDevicePubli
   const recipientPublicKey = createPublicKey(recipientDevicePublicKeyPem);
   const senderPrivateKey = createPrivateKey(senderDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: senderPrivateKey, publicKey: recipientPublicKey });
-  const wrappingKey = hkdfSha512(sharedSecret, 'sekure-session-wrap', 32);
+  const wrappingKey = hkdfSha512(sharedSecret, 'secure-session-wrap', 32);
   const encryptedSessionKey = encryptAesGcm(sessionKey, wrappingKey);
 
   return {
@@ -78,7 +78,7 @@ function decryptPayload(encryptedMessage, recipientDevicePrivateKeyPem, senderDe
   const senderPublicKey = createPublicKey(senderDevicePublicKeyPem);
   const recipientPrivateKey = createPrivateKey(recipientDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: recipientPrivateKey, publicKey: senderPublicKey });
-  const wrappingKey = hkdfSha512(sharedSecret, 'sekure-session-wrap', 32);
+  const wrappingKey = hkdfSha512(sharedSecret, 'secure-session-wrap', 32);
   const sessionKey = decryptAesGcm(encryptedMessage.encryptedSessionKey, wrappingKey);
   const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, sessionKey);
   return JSON.parse(decryptedPayload.toString('utf8'));

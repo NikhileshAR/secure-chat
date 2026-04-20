@@ -7,6 +7,7 @@ class RelayServer {
     this.messageTtlMs = messageTtlMs;
     this.connections = new Map();
     this.routeStore = new Map();
+    this.invalidMessageCounts = new WeakMap();
     this.wss = null;
   }
 
@@ -47,8 +48,14 @@ class RelayServer {
       try {
         message = JSON.parse(line);
       } catch {
+        const invalidCount = (this.invalidMessageCounts.get(socket) || 0) + 1;
+        this.invalidMessageCounts.set(socket, invalidCount);
+        if (invalidCount >= 5) {
+          socket.close();
+        }
         continue;
       }
+      this.invalidMessageCounts.delete(socket);
 
       if (message.type === 'handshake') {
         this.connections.set(message.senderDeviceId, socket);

@@ -1,5 +1,5 @@
 const { WebSocket } = require('ws');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, randomBytes } = require('node:crypto');
 const { generateIdentity } = require('./identity');
 const { encryptPayload, decryptPayload, computeRouteTag, signMessage, verifyMessage } = require('./crypto');
 
@@ -7,7 +7,7 @@ class SekureClient {
   constructor({ serverUrl, identity = generateIdentity(), postQuantumPublicKey }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
-    this.postQuantumPublicKey = postQuantumPublicKey || Buffer.from(randomUUID()).toString('base64');
+    this.postQuantumPublicKey = postQuantumPublicKey || randomBytes(32).toString('base64');
     this.socket = null;
   }
 

@@ -70,3 +70,19 @@ test('receiver can pull buffered chat by routeTag', async () => {
   receiver.close();
   server.stop();
 });
+
+test('server closes connections that repeatedly send malformed messages', async () => {
+  const port = 9100 + Math.floor(Math.random() * 200);
+  const server = new RelayServer({ host: '127.0.0.1', port, messageTtlMs: 10_000 });
+  server.start();
+
+  const socket = await openSocket(`ws://127.0.0.1:${port}`);
+  const closeWait = new Promise((resolve) => socket.once('close', resolve));
+  for (let i = 0; i < 5; i += 1) {
+    socket.send('{not-json}\n');
+  }
+
+  await closeWait;
+  assert.equal(socket.readyState, socket.CLOSED);
+  server.stop();
+});
