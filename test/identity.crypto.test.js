@@ -9,6 +9,7 @@ const {
 } = require('../src/client/identity');
 const {
   computeRouteTag,
+  deriveRouteTagEpoch,
   encryptPayload,
   decryptPayload,
   deriveInitialChainKey,
@@ -60,6 +61,24 @@ test('route tags are deterministic per shared secret and counter', () => {
   assert.notEqual(a, c);
   assert.notEqual(a, d);
   assert.equal(a.length, 128);
+});
+
+test('routeTag epochs evolve route tag spaces over time', () => {
+  const epoch0 = deriveRouteTagEpoch('shared-secret', 0);
+  const epoch1 = deriveRouteTagEpoch('shared-secret', 1);
+  const tags0 = [
+    computeRouteTag('shared-secret', 0, 'send', 0, epoch0),
+    computeRouteTag('shared-secret', 1, 'send', 0, epoch0),
+  ];
+  const tags1 = [
+    computeRouteTag('shared-secret', 32, 'send', 0, epoch1),
+    computeRouteTag('shared-secret', 33, 'send', 0, epoch1),
+  ];
+
+  assert.notEqual(epoch0, epoch1);
+  assert.equal(new Set(tags0).size, tags0.length);
+  assert.equal(new Set(tags1).size, tags1.length);
+  assert.equal(tags0.some((tag) => tags1.includes(tag)), false);
 });
 
 test('identity fingerprint is stable and display-friendly', () => {
