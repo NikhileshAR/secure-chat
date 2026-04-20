@@ -15,6 +15,8 @@ const ROUTE_COUNTER_SIZE = 8;
 const ROOT_KEY_SIZE = 32;
 const CHAIN_KEY_SIZE = 32;
 const MESSAGE_KEY_SIZE = 32;
+const PADDING_HEADER_SIZE = 8;
+const DEFAULT_PADDING_BUCKETS = [256, 512, 1024, 4096];
 
 function sha512(input) {
   return createHash('sha512').update(input).digest('hex');
@@ -57,9 +59,12 @@ function hkdfSha512(ikm, info, length, salt = Buffer.alloc(64, 0)) {
   return Buffer.concat(output).subarray(0, length);
 }
 
-function computeRouteTag(rootKey, counter = 0, direction = 'send') {
+function computeRouteTag(rootKey, counter = 0, direction = 'send', index = 0) {
   if (direction !== 'send' && direction !== 'receive') {
     throw new Error('Route tag direction must be send or receive');
+  }
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new Error('Route tag index must be a non-negative integer');
   }
   return createHash('sha512')
     .update(Buffer.concat([
@@ -68,8 +73,59 @@ function computeRouteTag(rootKey, counter = 0, direction = 'send') {
       encodeCounter(counter),
       Buffer.from([0]),
       Buffer.from(direction),
+      Buffer.from([0]),
+      encodeCounter(index),
     ]))
     .digest('hex');
+}
+
+function normalizePaddingBuckets(paddingSizeBuckets = DEFAULT_PADDING_BUCKETS) {
+  if (!Array.isArray(paddingSizeBuckets) || !paddingSizeBuckets.length) {
+    throw new Error('paddingSizeBuckets must be a non-empty array');
+  }
+  const normalized = [...new Set(
+    paddingSizeBuckets
+      .map((size) => Number(size))
+      .filter((size) => Number.isInteger(size) && size > PADDING_HEADER_SIZE),
+  )].sort((a, b) => a - b);
+  if (!normalized.length) {
+    throw new Error('paddingSizeBuckets must contain valid positive integer sizes');
+  }
+  return normalized;
+}
+
+function encodePaddedPayload(payloadBytes, { paddingSizeBuckets = DEFAULT_PADDING_BUCKETS } = {}) {
+  const payload = toBuffer(payloadBytes);
+  const buckets = normalizePaddingBuckets(paddingSizeBuckets);
+  const requiredLength = PADDING_HEADER_SIZE + payload.length;
+  const bucketSize = buckets.find((candidate) => candidate >= requiredLength);
+  if (!bucketSize) {
+    throw new Error(`Payload too large for configured padding buckets (${requiredLength} bytes required)`);
+  }
+
+  const paddingLength = bucketSize - requiredLength;
+  const padded = Buffer.alloc(bucketSize);
+  padded.writeUInt32BE(payload.length, 0);
+  padded.writeUInt32BE(paddingLength, 4);
+  payload.copy(padded, PADDING_HEADER_SIZE);
+  if (paddingLength > 0) {
+    randomBytes(paddingLength).copy(padded, PADDING_HEADER_SIZE + payload.length);
+  }
+  return padded;
+}
+
+function decodePaddedPayload(paddedPayload) {
+  const padded = toBuffer(paddedPayload);
+  if (padded.length < PADDING_HEADER_SIZE) {
+    throw new Error('Invalid padded payload: too short');
+  }
+  const payloadLength = padded.readUInt32BE(0);
+  const paddingLength = padded.readUInt32BE(4);
+  const expectedLength = PADDING_HEADER_SIZE + payloadLength + paddingLength;
+  if (expectedLength !== padded.length) {
+    throw new Error('Invalid padded payload: length metadata mismatch');
+  }
+  return padded.subarray(PADDING_HEADER_SIZE, PADDING_HEADER_SIZE + payloadLength);
 }
 
 function deriveInitialRootAndChainKeys(sharedSecret, isInitiator = true) {
@@ -127,13 +183,14 @@ function decryptAesGcm(payload, key) {
   return decrypted;
 }
 
-function encryptPayload(payload, senderDevicePrivateKeyPem, recipientDevicePublicKeyPem) {
+function encryptPayload(payload, senderDevicePrivateKeyPem, recipientDevicePublicKeyPem, options = {}) {
   const payloadBytes = Buffer.from(JSON.stringify(payload));
   const recipientPublicKey = createPublicKey(recipientDevicePublicKeyPem);
   const senderPrivateKey = createPrivateKey(senderDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: senderPrivateKey, publicKey: recipientPublicKey });
   const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', MESSAGE_KEY_SIZE);
-  const encryptedPayload = encryptAesGcm(payloadBytes, messageKey);
+  const paddedPayload = encodePaddedPayload(payloadBytes, options);
+  const encryptedPayload = encryptAesGcm(paddedPayload, messageKey);
 
   return {
     encryptedPayload,
@@ -145,19 +202,23 @@ function decryptPayload(encryptedMessage, recipientDevicePrivateKeyPem, senderDe
   const recipientPrivateKey = createPrivateKey(recipientDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: recipientPrivateKey, publicKey: senderPublicKey });
   const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', MESSAGE_KEY_SIZE);
-  const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, messageKey);
+  const decryptedPayload = decodePaddedPayload(decryptAesGcm(encryptedMessage.encryptedPayload, messageKey));
   return JSON.parse(decryptedPayload.toString('utf8'));
 }
 
-function encryptPayloadWithMessageKey(payload, messageKey, options) {
+function encryptPayloadWithMessageKey(payload, messageKey, options = {}) {
   const payloadBytes = Buffer.from(JSON.stringify(payload));
+  const { paddingSizeBuckets, ...cipherOptions } = options;
+  const paddedPayload = encodePaddedPayload(payloadBytes, { paddingSizeBuckets });
   return {
-    encryptedPayload: encryptAesGcm(payloadBytes, messageKey, options),
+    encryptedPayload: encryptAesGcm(paddedPayload, messageKey, cipherOptions),
   };
 }
 
 function decryptPayloadWithMessageKey(encryptedMessage, messageKey) {
-  const decryptedPayload = decryptAesGcm(encryptedMessage.encryptedPayload, messageKey);
+  const decryptedPayload = decodePaddedPayload(
+    decryptAesGcm(encryptedMessage.encryptedPayload, messageKey),
+  );
   return JSON.parse(decryptedPayload.toString('utf8'));
 }
 
@@ -219,6 +280,9 @@ module.exports = {
   hkdfSha512,
   deriveInitialRootAndChainKeys,
   deriveRootAndChainFromDh,
+  normalizePaddingBuckets,
+  encodePaddedPayload,
+  decodePaddedPayload,
   encryptPayload,
   decryptPayload,
   encryptPayloadWithMessageKey,
