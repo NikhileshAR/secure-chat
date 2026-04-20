@@ -213,10 +213,10 @@ class SecureClient {
       session.pendingReceiveKeys.delete(message.counter);
     } else {
       if (message.counter < session.receiveCounter) {
-        throw new Error('Out-of-window counter');
+        throw new Error('Message counter is below receive window (possible replay or old message)');
       }
       if (message.counter > session.receiveCounter + this.receiveWindow) {
-        throw new Error('Counter exceeded receive window');
+        throw new Error(`Message counter too far ahead (gap exceeds receive window of ${this.receiveWindow})`);
       }
 
       let chainKey = session.chainKeyReceive;

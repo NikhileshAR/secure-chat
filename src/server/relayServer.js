@@ -172,11 +172,11 @@ class RelayServer {
     while (this.totalStoredMessages() > this.maxTotalMessages) {
       let oldestRouteTag;
       let oldestIndex = -1;
-      let oldestStoredAt = Infinity;
+      let earliestStoredAt = Infinity;
       for (const [routeTag, entries] of this.routeStore.entries()) {
         for (let i = 0; i < entries.length; i += 1) {
-          if (entries[i].storedAt < oldestStoredAt) {
-            oldestStoredAt = entries[i].storedAt;
+          if (entries[i].storedAt < earliestStoredAt) {
+            earliestStoredAt = entries[i].storedAt;
             oldestRouteTag = routeTag;
             oldestIndex = i;
           }
