@@ -23,8 +23,9 @@ function toBuffer(value) {
 }
 
 function computeRouteTag(sharedSecret, counter = 0) {
+  const counterBuffer = Buffer.from(String(counter));
   return createHash('sha512')
-    .update(Buffer.concat([toBuffer(sharedSecret), Buffer.from(String(counter))]))
+    .update(Buffer.concat([toBuffer(sharedSecret), Buffer.from([0]), counterBuffer]))
     .digest('hex');
 }
 

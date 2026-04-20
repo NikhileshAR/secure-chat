@@ -22,6 +22,7 @@ class SecureClient {
     replayTtlMs = 120_000,
     receiveWindow = 10,
     maxPendingReceiveKeys = 256,
+    maxPullWindow = 50,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -30,6 +31,7 @@ class SecureClient {
     this.replayTtlMs = replayTtlMs;
     this.receiveWindow = receiveWindow;
     this.maxPendingReceiveKeys = maxPendingReceiveKeys;
+    this.maxPullWindow = maxPullWindow;
     this.sessions = new Map();
   }
 
@@ -236,7 +238,7 @@ class SecureClient {
   }
 
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
-    const boundedWindow = Math.max(0, Math.min(window, 50));
+    const boundedWindow = Math.max(0, Math.min(window, this.maxPullWindow));
     const routeTags = [];
     for (const routeSecret of routeSecrets) {
       const session = this.ensureSession({ routeSecret, peerDeviceId: `route:${routeSecret}` });
