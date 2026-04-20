@@ -4,6 +4,7 @@ const {
   createPublicKey,
   createPrivateKey,
   diffieHellman,
+  randomBytes,
   createCipheriv,
   createDecipheriv,
   sign,
