@@ -148,7 +148,12 @@ class RelayServer {
   isDuplicatePayload(message) {
     const now = Date.now();
     const routeTag = message.routeTag;
-    const payload = JSON.stringify([message.senderDeviceId || '', message.encryptedPayload || '']);
+    const payload = JSON.stringify([
+      message.senderDeviceId || '',
+      message.messageId || '',
+      typeof message.counter === 'number' ? message.counter : '',
+      message.encryptedPayload || '',
+    ]);
     const fingerprint = createHash('sha256').update(payload).digest('hex');
     const entries = this.recentPayloadFingerprints.get(routeTag) || [];
     const live = entries.filter((entry) => now - entry.seenAt <= this.duplicateWindowMs);
