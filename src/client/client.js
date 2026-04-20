@@ -54,6 +54,7 @@ const DEFAULT_MIXING_DELAY_RANGE_MS = { min: 0, max: 0 };
 const DEFAULT_INBOUND_DELAY_RANGE_MS = { min: 5, max: 35 };
 const DEFAULT_SMOOTHING_WINDOW_MS = 5_000;
 const DEFAULT_SMOOTHING_VARIANCE = 0.15;
+const DECOY_SESSION_PREFIX = '_decoy_session:';
 
 function normalizeRange(range, fallback) {
   const min = Number(range?.min ?? fallback.min);
@@ -412,7 +413,7 @@ class SecureClient {
       currentReceiveDhKey: peerDevicePublicKey,
       ratchetPending: false,
       expiresAt: now + this.sessionTtlMs,
-      isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith('_decoy_session:'),
+      isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith(DECOY_SESSION_PREFIX),
     };
 
     this.sessions.set(sessionId, session);
@@ -425,7 +426,7 @@ class SecureClient {
     }
     while (this.decoyRouteSecrets.length < this.decoySessionCount) {
       const routeSecret = `decoy:${this.identity.deviceId}:${randomUUID()}`;
-      const peerDeviceId = `_decoy_session:${this.decoyRouteSecrets.length}:${routeSecret}`;
+      const peerDeviceId = `${DECOY_SESSION_PREFIX}${this.decoyRouteSecrets.length}:${routeSecret}`;
       this.ensureSession({ routeSecret, peerDeviceId });
       this.decoyRouteSecrets.push(routeSecret);
     }
@@ -639,7 +640,7 @@ class SecureClient {
     if (!values.length) {
       return null;
     }
-    const index = randomInt(0, values.length);
+    const index = randomInt(values.length);
     return values[index];
   }
 
@@ -667,10 +668,11 @@ class SecureClient {
   selectSessionForDummy() {
     const sessions = [...this.sessions.entries()]
       .filter(([, session]) => session && session.rootKey && session.selfDHKeyPair?.publicKey);
-    if (!sessions.length) {
+    const sessionCount = sessions.length;
+    if (!sessionCount) {
       return null;
     }
-    const index = this.dummySessionRoundRobin % sessions.length;
+    const index = this.dummySessionRoundRobin % sessionCount;
     this.dummySessionRoundRobin += 1;
     return sessions[index];
   }

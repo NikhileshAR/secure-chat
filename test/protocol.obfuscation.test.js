@@ -417,7 +417,10 @@ test('constant traffic interleaves multiple real sessions', async () => {
         realLabels.push('a');
         continue;
       }
-    } catch {}
+    } catch (error) {
+      void error;
+      // message belongs to a different session
+    }
     try {
       decoded = receiverB.decryptChat({
         message,
@@ -428,7 +431,10 @@ test('constant traffic interleaves multiple real sessions', async () => {
       if (decoded) {
         realLabels.push('b');
       }
-    } catch {}
+    } catch (error) {
+      void error;
+      // message belongs to a different session
+    }
   }
 
   assert.ok(realLabels.includes('a'));
