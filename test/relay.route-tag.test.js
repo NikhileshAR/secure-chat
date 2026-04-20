@@ -90,3 +90,50 @@ test('server closes connections that repeatedly send malformed messages', async 
   assert.equal(socket.readyState, socket.CLOSED);
   server.stop();
 });
+
+test('server enforces per-device rate limits', async () => {
+  const port = 9300 + Math.floor(Math.random() * 200);
+  const server = new RelayServer({
+    host: '127.0.0.1',
+    port,
+    messageTtlMs: 10_000,
+    perDeviceRateLimit: { windowMs: 1_000, maxMessages: 2 },
+  });
+  server.start();
+
+  const socket = await openSocket(`ws://127.0.0.1:${port}`);
+  const closeWait = new Promise((resolve) => socket.once('close', resolve));
+  for (let i = 0; i < 3; i += 1) {
+    socket.send(`${JSON.stringify({
+      type: 'control',
+      action: 'pull',
+      senderDeviceId: 'rate-limited-device',
+      routeTags: [],
+      encryptedPayload: '',
+      timestamp: Date.now(),
+    })}\n`);
+  }
+  await closeWait;
+
+  assert.equal(socket.readyState, socket.CLOSED);
+  server.stop();
+});
+
+test('server enforces max message size', async () => {
+  const port = 9500 + Math.floor(Math.random() * 200);
+  const server = new RelayServer({
+    host: '127.0.0.1',
+    port,
+    messageTtlMs: 10_000,
+    maxMessageSizeBytes: 128,
+  });
+  server.start();
+
+  const socket = await openSocket(`ws://127.0.0.1:${port}`);
+  const closeWait = new Promise((resolve) => socket.once('close', resolve));
+  socket.send(`${'x'.repeat(512)}\n`);
+  await closeWait;
+
+  assert.equal(socket.readyState, socket.CLOSED);
+  server.stop();
+});

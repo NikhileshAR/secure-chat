@@ -9,6 +9,10 @@ class RelayServer {
     maxMessagesPerRouteTag = 100,
     maxTotalMessages = 5_000,
     duplicateWindowMs = 5_000,
+    maxMessageSizeBytes = 64 * 1024,
+    perDeviceRateLimit = { windowMs: 1_000, maxMessages: 120 },
+    perRouteTagRateLimit = { windowMs: 1_000, maxMessages: 200 },
+    connectionRateLimit = { windowMs: 1_000, maxMessages: 300 },
   } = {}) {
     this.host = host;
     this.port = port;
@@ -16,10 +20,18 @@ class RelayServer {
     this.maxMessagesPerRouteTag = maxMessagesPerRouteTag;
     this.maxTotalMessages = maxTotalMessages;
     this.duplicateWindowMs = duplicateWindowMs;
+    this.maxMessageSizeBytes = maxMessageSizeBytes;
+    this.perDeviceRateLimit = perDeviceRateLimit;
+    this.perRouteTagRateLimit = perRouteTagRateLimit;
+    this.connectionRateLimit = connectionRateLimit;
+
     this.connections = new Map();
     this.routeStore = new Map();
     this.invalidMessageCounts = new WeakMap();
     this.recentPayloadFingerprints = new Map();
+    this.deviceMessageRates = new Map();
+    this.routeTagMessageRates = new Map();
+    this.connectionMessageRates = new WeakMap();
     this.wss = null;
   }
 
@@ -44,6 +56,8 @@ class RelayServer {
     this.connections.clear();
     this.routeStore.clear();
     this.recentPayloadFingerprints.clear();
+    this.deviceMessageRates.clear();
+    this.routeTagMessageRates.clear();
   }
 
   cleanupSocket(socket) {
@@ -52,11 +66,51 @@ class RelayServer {
         this.connections.delete(deviceId);
       }
     }
+    this.connectionMessageRates.delete(socket);
+  }
+
+  checkRateLimit(store, key, { maxMessages, windowMs }, now = Date.now()) {
+    const events = (store.get(key) || []).filter((timestamp) => now - timestamp <= windowMs);
+    if (events.length >= maxMessages) {
+      store.set(key, events);
+      return false;
+    }
+    events.push(now);
+    store.set(key, events);
+    return true;
+  }
+
+  checkConnectionRateLimit(socket, now = Date.now()) {
+    const events = (this.connectionMessageRates.get(socket) || [])
+      .filter((timestamp) => now - timestamp <= this.connectionRateLimit.windowMs);
+
+    if (events.length >= this.connectionRateLimit.maxMessages) {
+      this.connectionMessageRates.set(socket, events);
+      return false;
+    }
+    events.push(now);
+    this.connectionMessageRates.set(socket, events);
+    return true;
   }
 
   handleMessage(socket, rawMessage) {
+    if (Buffer.byteLength(rawMessage, 'utf8') > this.maxMessageSizeBytes) {
+      socket.close();
+      return;
+    }
+
     const lines = rawMessage.split('\n').map((line) => line.trim()).filter(Boolean);
     for (const line of lines) {
+      if (Buffer.byteLength(line, 'utf8') > this.maxMessageSizeBytes) {
+        socket.close();
+        return;
+      }
+
+      if (!this.checkConnectionRateLimit(socket)) {
+        socket.close();
+        return;
+      }
+
       let message;
       try {
         message = JSON.parse(line);
@@ -70,12 +124,35 @@ class RelayServer {
       }
       this.invalidMessageCounts.delete(socket);
 
+      if (message.senderDeviceId) {
+        const ok = this.checkRateLimit(
+          this.deviceMessageRates,
+          message.senderDeviceId,
+          this.perDeviceRateLimit,
+        );
+        if (!ok) {
+          socket.close();
+          return;
+        }
+      }
+
       if (message.type === 'handshake') {
         this.connections.set(message.senderDeviceId, socket);
         continue;
       }
 
       if (message.type === 'chat') {
+        if (message.routeTag) {
+          const routeOk = this.checkRateLimit(
+            this.routeTagMessageRates,
+            message.routeTag,
+            this.perRouteTagRateLimit,
+          );
+          if (!routeOk) {
+            continue;
+          }
+        }
+
         this.storeChatByRouteTag(message);
 
         const target = message.targetDeviceId && this.connections.get(message.targetDeviceId);
