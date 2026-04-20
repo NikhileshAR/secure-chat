@@ -211,11 +211,12 @@ class SecureClient {
   }
 
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
+    const boundedWindow = Math.max(0, Math.min(window, 50));
     const routeTags = [];
     for (const routeSecret of routeSecrets) {
       const session = this.ensureSession({ routeSecret, peerDeviceId: `route:${routeSecret}` });
-      const start = Math.max(0, session.receiveCounter - window);
-      const end = session.receiveCounter + window;
+      const start = Math.max(0, session.receiveCounter - boundedWindow);
+      const end = session.receiveCounter + boundedWindow;
       for (let counter = start; counter <= end; counter += 1) {
         routeTags.push(computeRouteTag(session.sharedSecret, counter));
       }

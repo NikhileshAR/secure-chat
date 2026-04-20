@@ -153,7 +153,9 @@ class RelayServer {
     const entries = this.recentPayloadFingerprints.get(routeTag) || [];
     const live = entries.filter((entry) => now - entry.seenAt <= this.duplicateWindowMs);
     const alreadySeen = live.some((entry) => entry.fingerprint === fingerprint);
-    live.push({ fingerprint, seenAt: now });
+    if (!alreadySeen) {
+      live.push({ fingerprint, seenAt: now });
+    }
     this.recentPayloadFingerprints.set(routeTag, live);
     return alreadySeen;
   }
