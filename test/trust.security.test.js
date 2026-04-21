@@ -7,6 +7,7 @@ const path = require('node:path');
 const { TrustStore, TRUST_LEVELS } = require('../src/client/storage/trustStore');
 const {
   generateIdentity,
+  rotateDeviceIdentity,
   fingerprintIdentityPublicKey,
   generateVerificationString,
   compareFingerprints,
@@ -262,7 +263,7 @@ test('device fingerprints are tracked per TrustEntry', () => {
     client.checkAndUpdateTrust(peerKey, deviceKey1);
 
     // Rotate device key (new device)
-    const rotated = require('../src/client/identity').rotateDeviceIdentity(peer, { rotateDeviceId: true });
+    const rotated = rotateDeviceIdentity(peer, { rotateDeviceId: true });
     const deviceKey2 = rotated.deviceKeyPair.publicKey;
 
     // Second message from device 2
