@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const SESSION_SCHEMA_VERSION = 1;
+const PBKDF2_ITERATIONS = 600_000;
 
 function toBuffer(value) {
   if (Buffer.isBuffer(value)) {
@@ -48,12 +49,23 @@ class SessionStore {
     }
     this.storageDir = storageDir;
     this.filePath = path.join(storageDir, filename);
-    this.ttlMs = Math.max(1, Number(ttlMs) || ttlMs);
-    this.maxSkippedMessageKeys = Math.max(1, Number(maxSkippedMessageKeys) || maxSkippedMessageKeys);
+    const parsedTtl = Number(ttlMs);
+    this.ttlMs = Number.isFinite(parsedTtl) && parsedTtl > 0
+      ? parsedTtl
+      : 24 * 60 * 60 * 1000;
+    const parsedSkipped = Number(maxSkippedMessageKeys);
+    this.maxSkippedMessageKeys = Number.isFinite(parsedSkipped) && parsedSkipped > 0
+      ? Math.floor(parsedSkipped)
+      : 512;
+    this.deviceSecret = String(deviceSecret);
+  }
 
-    const master = pbkdf2Sync(String(deviceSecret), 'securechat-session-store', 310_000, 64, 'sha256');
-    this.encKey = master.subarray(0, 32);
-    this.macKey = master.subarray(32, 64);
+  deriveKeys(salt) {
+    const master = pbkdf2Sync(this.deviceSecret, salt, PBKDF2_ITERATIONS, 64, 'sha256');
+    return {
+      encKey: master.subarray(0, 32),
+      macKey: master.subarray(32, 64),
+    };
   }
 
   serializeSession(sessionId, session) {
@@ -111,11 +123,13 @@ class SessionStore {
 
   encryptDocument(doc) {
     const plaintext = Buffer.from(stableStringify(doc));
+    const salt = randomBytes(16);
+    const { encKey, macKey } = this.deriveKeys(salt);
     const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.encKey, iv);
+    const cipher = createCipheriv('aes-256-gcm', encKey, iv);
     const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     const tag = cipher.getAuthTag();
-    const mac = createHmac('sha256', this.macKey)
+    const mac = createHmac('sha256', macKey)
       .update(iv)
       .update(tag)
       .update(ciphertext)
@@ -123,6 +137,7 @@ class SessionStore {
 
     return {
       schemaVersion: SESSION_SCHEMA_VERSION,
+      salt: salt.toString('base64'),
       iv: iv.toString('base64'),
       tag: tag.toString('base64'),
       ciphertext: ciphertext.toString('base64'),
@@ -135,10 +150,12 @@ class SessionStore {
       throw new Error('SessionStore unsupported schema version');
     }
 
+    const salt = Buffer.from(blob.salt, 'base64');
+    const { encKey, macKey } = this.deriveKeys(salt);
     const iv = Buffer.from(blob.iv, 'base64');
     const tag = Buffer.from(blob.tag, 'base64');
     const ciphertext = Buffer.from(blob.ciphertext, 'base64');
-    const expectedMac = createHmac('sha256', this.macKey)
+    const expectedMac = createHmac('sha256', macKey)
       .update(iv)
       .update(tag)
       .update(ciphertext)
@@ -148,7 +165,7 @@ class SessionStore {
       throw new Error('SessionStore MAC verification failed');
     }
 
-    const decipher = createDecipheriv('aes-256-gcm', this.encKey, iv);
+    const decipher = createDecipheriv('aes-256-gcm', encKey, iv);
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     return JSON.parse(plaintext.toString('utf8'));
@@ -187,8 +204,19 @@ class SessionStore {
     }
 
     const raw = fs.readFileSync(this.filePath, 'utf8');
-    const encryptedBlob = JSON.parse(raw);
-    const doc = this.decryptDocument(encryptedBlob);
+    let encryptedBlob;
+    try {
+      encryptedBlob = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`SessionStore file is not valid JSON: ${error.message}`);
+    }
+
+    let doc;
+    try {
+      doc = this.decryptDocument(encryptedBlob);
+    } catch (error) {
+      throw new Error(`SessionStore decryption failed: ${error.message}`);
+    }
     const records = this.cleanupRecords(doc.records || []);
     const sessions = new Map();
     for (const record of records) {

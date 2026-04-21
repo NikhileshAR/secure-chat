@@ -233,7 +233,9 @@ class SecureClient {
       }
     } catch (error) {
       this.sessions = new Map();
-      void error;
+      if (process.env.SECURECHAT_DEBUG_PERSISTENCE === '1') {
+        console.warn('SecureClient: failed to load persisted sessions:', error.message);
+      }
     }
   }
 
@@ -312,7 +314,9 @@ class SecureClient {
       }
       pending.attempts += 1;
       pending.lastAttemptAt = now;
-      this.sendRaw({ ...pending.envelope, deliveredAt: undefined });
+      const retryEnvelope = { ...pending.envelope };
+      delete retryEnvelope.deliveredAt;
+      this.sendRaw(retryEnvelope);
     }
   }
 
@@ -376,8 +380,8 @@ class SecureClient {
       throw new Error('Client is not connected');
     }
     const withVersion = {
-      protocolVersion: this.protocolVersion,
       ...message,
+      protocolVersion: this.protocolVersion,
     };
     validateMessage(withVersion);
     this.socket.send(`${JSON.stringify(withVersion)}\n`);

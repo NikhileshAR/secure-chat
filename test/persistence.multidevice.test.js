@@ -64,6 +64,8 @@ test('session persistence resumes ratchet state across restart and rejects repla
     routeSecret: 'persist-route',
   });
   assert.equal(replay, null);
+  const restoredSession = bobRestarted.sessions.get(aliceIdentity.deviceId);
+  assert.equal(restoredSession.seenMessageIds.has(sent[0].messageId), true);
 
   alice.sendChat({
     content: 'persist-2',

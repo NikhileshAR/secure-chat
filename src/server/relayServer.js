@@ -132,7 +132,9 @@ class RelayServer {
 
       let message;
       try {
-        message = ensureProtocolVersion(normalizeControlMessage(JSON.parse(line)));
+        const parsedLine = JSON.parse(line);
+        const normalizedMessage = normalizeControlMessage(parsedLine);
+        message = ensureProtocolVersion(normalizedMessage);
       } catch {
         const invalidCount = (this.invalidMessageCounts.get(socket) || 0) + 1;
         this.invalidMessageCounts.set(socket, invalidCount);
@@ -162,6 +164,14 @@ class RelayServer {
 
       if (message.type === 'chat' || message.type === 'ack') {
         if (typeof message.senderDeviceId !== 'string' || typeof message.encryptedPayload !== 'string') {
+          continue;
+        }
+        if (
+          message.senderDeviceId.length > 512
+          || message.encryptedPayload.length > this.maxMessageSizeBytes
+          || (typeof message.messageId === 'string' && message.messageId.length > 512)
+          || (typeof message.routeTag === 'string' && message.routeTag.length > 4096)
+        ) {
           continue;
         }
         if (message.routeTag) {

@@ -19,6 +19,7 @@ test('key vault encrypts at rest and unlocks in memory only', () => {
   const stored = fs.readFileSync(path.join(dir, 'securechat.keys.enc'), 'utf8');
   assert.equal(stored.includes('identity-private-key'), false);
   assert.equal(stored.includes('device-private-key'), false);
+  assert.throws(() => vault.unlock('wrong-passphrase'), /authentication failed/i);
 
   const unlocked = vault.unlock('passphrase-1');
   assert.equal(unlocked.identityPrivateKey, 'identity-private-key');

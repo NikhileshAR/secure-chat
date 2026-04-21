@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const KEY_VAULT_SCHEMA_VERSION = 1;
+const PBKDF2_ITERATIONS = 600_000;
 
 function deriveKey(passphrase, salt, options = {}) {
   const normalizedPassphrase = String(passphrase || '');
@@ -35,7 +36,7 @@ function deriveKey(passphrase, salt, options = {}) {
     };
   }
 
-  const iterations = 310_000;
+  const iterations = PBKDF2_ITERATIONS;
   return {
     kdf: {
       type: 'pbkdf2-sha256',
@@ -58,7 +59,7 @@ function deriveKeyFromStoredKdf(passphrase, kdf) {
       tagLength: 32,
     });
   }
-  return pbkdf2Sync(String(passphrase || ''), salt, kdf.iterations || 310_000, 32, 'sha256');
+  return pbkdf2Sync(String(passphrase || ''), salt, kdf.iterations || PBKDF2_ITERATIONS, 32, 'sha256');
 }
 
 class KeyVault {

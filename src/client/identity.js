@@ -63,7 +63,7 @@ function formatIdentityFingerprint(identityPublicKeyPem, groupSize = 4) {
   return groups.join(':');
 }
 
-function compareIdentityFingerprints(previousIdentityPublicKeyPem, nextIdentityPublicKeyPem) {
+function getIdentityFingerprintChange(previousIdentityPublicKeyPem, nextIdentityPublicKeyPem) {
   const previousFingerprint = previousIdentityPublicKeyPem
     ? fingerprintIdentityPublicKey(previousIdentityPublicKeyPem)
     : null;
@@ -238,5 +238,5 @@ module.exports = {
   verifyDeviceKeyBinding,
   fingerprintIdentityPublicKey,
   formatIdentityFingerprint,
-  compareIdentityFingerprints,
+  getIdentityFingerprintChange,
 };
