@@ -88,7 +88,7 @@ class SecurityState {
         if (next.environmentRisk !== ENVIRONMENT_RISK.HIGH) {
           next.environmentRisk = ENVIRONMENT_RISK.LOW;
         }
-        if (next.identityIntegrity === IDENTITY_INTEGRITY.UNVERIFIED && next.trustLevel === TRUST_LEVEL.VERIFIED) {
+        if (next.trustLevel === TRUST_LEVEL.VERIFIED) {
           next.identityIntegrity = IDENTITY_INTEGRITY.OK;
         }
         break;

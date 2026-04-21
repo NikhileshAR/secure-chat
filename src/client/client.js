@@ -155,6 +155,7 @@ class SecureClient {
     this.receiveWindow = receiveWindow;
     this.maxPendingReceiveKeys = maxPendingReceiveKeys;
     this.maxSkippedMessageKeys = maxSkippedMessageKeys || maxPendingReceiveKeys;
+    this.hardenedMaxSkippedMessageKeys = Math.max(8, Math.min(this.maxSkippedMessageKeys, 128));
     this.maxPullWindow = maxPullWindow;
     this.maxPullRouteTags = maxPullRouteTags;
     this.sessionTtlMs = sessionTtlMs;
@@ -283,7 +284,6 @@ class SecureClient {
       deviceSecret,
       persistenceEnabled: securityLogPersistenceEnabled,
     });
-    this.maxSkippedMessageKeys = Math.max(8, Math.min(this.maxSkippedMessageKeys, 128));
     this.securityStateUnsubscribe = this.securityState.subscribe((state) => {
       if (state.sessionHealth !== SESSION_HEALTH.SUSPECT) {
         this.retryQuarantinedMessages();
@@ -423,7 +423,13 @@ class SecureClient {
     this.quarantineQueue = [];
     for (const item of pending) {
       try {
-        this.decryptChatInternal(item.params, { allowQuarantine: false, acknowledge: true });
+        const payload = this.decryptChatInternal(
+          item.params,
+          { allowQuarantine: false, acknowledge: false },
+        );
+        if (payload && item.params?.message) {
+          this.acknowledgeDelivery(item.params.message);
+        }
       } catch (error) {
         item.attempts += 1;
         if (item.attempts < 2) {
@@ -799,10 +805,10 @@ class SecureClient {
   }
 
   pruneSkippedMessageKeys(session) {
-    if (session.skippedMessageKeys.size <= this.maxSkippedMessageKeys) {
+    if (session.skippedMessageKeys.size <= this.hardenedMaxSkippedMessageKeys) {
       return;
     }
-    const overflow = session.skippedMessageKeys.size - this.maxSkippedMessageKeys;
+    const overflow = session.skippedMessageKeys.size - this.hardenedMaxSkippedMessageKeys;
     const keys = session.skippedMessageKeys.keys();
     for (let i = 0; i < overflow; i += 1) {
       const next = keys.next();
@@ -1270,30 +1276,39 @@ class SecureClient {
       throw new Error(`Protocol violation: counter outside receive window (${this.receiveWindow})`);
     }
 
+    const originalReceiveChainKey = session.chainKeyReceive;
     let chainKey = session.chainKeyReceive;
-    for (let counter = session.receiveCounter; counter < message.counter; counter += 1) {
-      const skippedKey = deriveMessageKey(chainKey);
-      const nextChain = deriveNextChainKey(chainKey);
-      if (counter > session.receiveCounter) {
+    let finalized = false;
+    try {
+      for (let counter = session.receiveCounter; counter < message.counter; counter += 1) {
+        const currentChainKey = chainKey;
+        const skippedKey = deriveMessageKey(currentChainKey);
+        const nextChain = deriveNextChainKey(currentChainKey);
+        if (currentChainKey !== originalReceiveChainKey) {
+          this.zeroizeBuffer(currentChainKey);
+        }
+        chainKey = nextChain;
+        session.skippedMessageKeys.set(
+          this.makeSkippedKeyId(session.currentReceiveDhKey, counter),
+          skippedKey,
+        );
+        this.pruneSkippedMessageKeys(session);
+      }
+  
+      const messageKey = deriveMessageKey(chainKey);
+      session.chainKeyReceive = deriveNextChainKey(chainKey);
+      if (message.counter > session.receiveCounter) {
+        this.zeroizeBuffer(originalReceiveChainKey);
+      }
+      this.zeroizeBuffer(chainKey);
+      session.receiveCounter = message.counter + 1;
+      finalized = true;
+      return messageKey;
+    } finally {
+      if (!finalized) {
         this.zeroizeBuffer(chainKey);
       }
-      chainKey = nextChain;
-      session.skippedMessageKeys.set(
-        this.makeSkippedKeyId(session.currentReceiveDhKey, counter),
-        skippedKey,
-      );
-      this.pruneSkippedMessageKeys(session);
     }
-
-    const messageKey = deriveMessageKey(chainKey);
-    const previousChainKey = session.chainKeyReceive;
-    session.chainKeyReceive = deriveNextChainKey(chainKey);
-    if (previousChainKey !== chainKey) {
-      this.zeroizeBuffer(previousChainKey);
-    }
-    this.zeroizeBuffer(chainKey);
-    session.receiveCounter = message.counter + 1;
-    return messageKey;
   }
 
   decryptChat({ message, senderDevicePublicKey, senderIdentityPublicKey, routeSecret }) {
@@ -1393,8 +1408,12 @@ class SecureClient {
     this.touchSession(session);
     this.persistSessions();
 
-    const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
-    this.zeroizeBuffer(messageKey);
+    let payload;
+    try {
+      payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
+    } finally {
+      this.zeroizeBuffer(messageKey);
+    }
     if (payload?.isDummy) {
       return null;
     }

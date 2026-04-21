@@ -8,7 +8,7 @@ const { RelayServer } = require('../src/server/relayServer');
 
 function createClient(identity, options = {}) {
   const client = new SecureClient({
-    serverUrl: 'ws://127.0.0.1:1',
+    serverUrl: 'ws://127.0.0.1:10001',
     identity,
     sendDelayRangeMs: { min: 0, max: 0 },
     batchingWindowMs: 0,
@@ -57,35 +57,29 @@ test('malformed message payload is dropped without client crash or state corrupt
   });
 
   assert.equal(bob.sessions.size, sessionsBefore);
-  assert.ok(bob.getSecuritySummary().warnings.length >= 0);
+  assert.ok(Array.isArray(bob.getSecuritySummary().warnings));
 });
 
 test('invalid counter gaps are rejected and do not corrupt receive chain state', () => {
   const aliceIdentity = generateIdentity();
   const bobIdentity = generateIdentity();
   const { client: alice, sent } = createClient(aliceIdentity);
-  const { client: bob } = createClient(bobIdentity, { receiveWindow: 0 });
+  const { client: bob } = createClient(bobIdentity);
 
-  alice.sendChat({
-    content: 'first',
-    recipientDeviceId: bobIdentity.deviceId,
-    recipientDevicePublicKey: bobIdentity.deviceKeyPair.publicKey,
-    recipientIdentityPublicKey: bobIdentity.identityKeyPair.publicKey,
-    routeSecret: 'counter-gap-route',
-  });
+  for (let i = 0; i < 15; i += 1) {
+    alice.sendChat({
+      content: `msg-${i}`,
+      recipientDeviceId: bobIdentity.deviceId,
+      recipientDevicePublicKey: bobIdentity.deviceKeyPair.publicKey,
+      recipientIdentityPublicKey: bobIdentity.identityKeyPair.publicKey,
+      routeSecret: 'counter-gap-route',
+    });
+  }
 
-  alice.sendChat({
-    content: 'second',
-    recipientDeviceId: bobIdentity.deviceId,
-    recipientDevicePublicKey: bobIdentity.deviceKeyPair.publicKey,
-    recipientIdentityPublicKey: bobIdentity.identityKeyPair.publicKey,
-    routeSecret: 'counter-gap-route',
-  });
-
-  const tampered = sent[1];
+  const farAhead = sent[sent.length - 1];
   assert.throws(() => {
     bob.decryptChat({
-      message: tampered,
+      message: farAhead,
       senderDevicePublicKey: aliceIdentity.deviceKeyPair.publicKey,
       senderIdentityPublicKey: aliceIdentity.identityKeyPair.publicKey,
       routeSecret: 'counter-gap-route',

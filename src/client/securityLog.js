@@ -95,7 +95,11 @@ class SecurityLog {
   }
 
   decryptDocument(blob) {
-    if (!blob || blob.schemaVersion !== SECURITY_LOG_SCHEMA_VERSION) {
+    if (
+      !blob
+      || typeof blob.schemaVersion !== 'number'
+      || blob.schemaVersion !== SECURITY_LOG_SCHEMA_VERSION
+    ) {
       throw new Error('SecurityLog unsupported schema version');
     }
     const salt = Buffer.from(blob.salt, 'base64');
