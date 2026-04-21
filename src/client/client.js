@@ -72,10 +72,13 @@ const DECOY_SESSION_PREFIX = '_decoy_session:';
 const DEFAULT_QUARANTINE_LIMIT = 128;
 const DEFAULT_SAFE_MODE_THRESHOLDS = {
   handshakeMismatches: 3,
-  routeTagMismatchSpike: 8,
-  invalidSignatureRate: 8,
-  relayFloodRate: 80,
-  burstAnomalyRate: 25,
+  routeTagMismatchSpike: 12,
+  invalidSignatureRate: 12,
+  relayFloodRate: 500,
+  burstAnomalyRate: 500,
+  replayAttemptRate: 24,
+  counterGapRate: 8,
+  droppedMessageRate: 24,
   windowMs: 10_000,
 };
 const DEFAULT_LONG_INACTIVITY_MS = 5 * 60_000;
@@ -1249,17 +1252,21 @@ class SecureClient {
     }
 
     if (message.counter < session.receiveCounter) {
-      this.noteTimestamp(this.replayAttemptTimestamps);
-      this.recordSecurityEvent('excessive_replay_attempts', { counter: message.counter }, {
-        type: 'excessive_replay_attempts',
-      });
+      const replayRate = this.noteTimestamp(this.replayAttemptTimestamps);
+      if (replayRate >= this.securityThresholds.replayAttemptRate) {
+        this.recordSecurityEvent('excessive_replay_attempts', { counter: message.counter }, {
+          type: 'excessive_replay_attempts',
+        });
+      }
       throw new Error('Protocol violation: invalid counter (replay or outside receive window)');
     }
     if (message.counter > session.receiveCounter + this.receiveWindow) {
-      this.noteTimestamp(this.counterGapTimestamps);
-      this.recordSecurityEvent('abnormal_counter_gaps', { counter: message.counter }, {
-        type: 'abnormal_counter_gaps',
-      });
+      const gapRate = this.noteTimestamp(this.counterGapTimestamps);
+      if (gapRate >= this.securityThresholds.counterGapRate) {
+        this.recordSecurityEvent('abnormal_counter_gaps', { counter: message.counter }, {
+          type: 'abnormal_counter_gaps',
+        });
+      }
       throw new Error(`Protocol violation: counter outside receive window (${this.receiveWindow})`);
     }
 
@@ -1324,8 +1331,8 @@ class SecureClient {
         normalizedMessage.senderDeviceId,
       );
       if (trustResult === 'BLOCKED') {
-        this.noteTimestamp(this.droppedMessageTimestamps);
-        if (this.droppedMessageTimestamps.length >= this.securityThresholds.invalidSignatureRate) {
+        const dropped = this.noteTimestamp(this.droppedMessageTimestamps);
+        if (dropped >= this.securityThresholds.droppedMessageRate) {
           this.recordSecurityEvent('high_dropped_message_rate', { count: this.droppedMessageTimestamps.length }, {
             type: 'high_dropped_message_rate',
           });
@@ -1344,10 +1351,9 @@ class SecureClient {
 
     if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
       const rate = this.noteTimestamp(this.invalidSignatureTimestamps);
-      this.recordSecurityEvent('invalid_signature', { senderDeviceId: normalizedMessage.senderDeviceId }, {
-        type: 'repeated_message_failures',
-      });
+      this.recordSecurityEvent('invalid_signature', { senderDeviceId: normalizedMessage.senderDeviceId });
       if (rate >= this.securityThresholds.invalidSignatureRate) {
+        this.securityState.updateState({ type: 'repeated_message_failures' });
         this.enterSafeMode('invalid signature rate exceeded');
       }
       throw new Error('Protocol violation: invalid message signature');
@@ -1363,7 +1369,7 @@ class SecureClient {
     this.pruneSeenMessageIds(session.seenMessageIds);
     if (session.seenMessageIds.has(normalizedMessage.messageId)) {
       const replayRate = this.noteTimestamp(this.replayAttemptTimestamps);
-      if (replayRate >= this.securityThresholds.invalidSignatureRate) {
+      if (replayRate >= this.securityThresholds.replayAttemptRate) {
         this.securityState.updateState({ type: 'excessive_replay_attempts' });
       }
       return null;
@@ -1375,10 +1381,9 @@ class SecureClient {
     const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
     if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
       const routeRate = this.noteTimestamp(this.routeTagMismatchTimestamps);
-      this.recordSecurityEvent('route_tag_mismatch', { senderDeviceId: normalizedMessage.senderDeviceId }, {
-        type: 'repeated_message_failures',
-      });
+      this.recordSecurityEvent('route_tag_mismatch', { senderDeviceId: normalizedMessage.senderDeviceId });
       if (routeRate >= this.securityThresholds.routeTagMismatchSpike) {
+        this.securityState.updateState({ type: 'repeated_message_failures' });
         this.enterSafeMode('routeTag mismatch spike');
       }
       throw new Error('Protocol violation: routeTag mismatch');
