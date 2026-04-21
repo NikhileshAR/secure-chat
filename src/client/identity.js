@@ -243,9 +243,9 @@ const VERIFICATION_WORDS = [
   'hook','hope','horn','hour','huge','hull','hunt','hurt','hymn','icon',
   'idea','idle','inch','into','iris','iron','isle','item','jack','jade',
   'jail','java','jazz','join','joke','jolt','jump','june','just','keen',
-  'keep','kent','kern','kind','king','knot','lake','lamp','land','lane',
-  'last','late','lava','lawn','leaf','lean','left','lend',
-];
+  'keep','kind','knot','lake','lamp','land','lane','last','late','lava',
+  'lawn','leaf','lean','left','lend','levy',
+]; // exactly 256 entries
 
 /**
  * Returns true when two fingerprint hex strings are equal (timing-safe).

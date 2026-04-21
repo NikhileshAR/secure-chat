@@ -120,25 +120,25 @@ test('VERIFIED identity key change throws hard error', () => {
   const dir = makeDir();
   try {
     const client = makeClient(generateIdentity(), dir);
-    const peer = generateIdentity();
-    const peerKey = peer.identityKeyPair.publicKey;
+    const peerA = generateIdentity();
+    const peerAKey = peerA.identityKeyPair.publicKey;
 
-    // Mark as VERIFIED
-    client.verifyIdentity(peerKey);
-    assert.equal(client.getTrustLevel(peerKey), TRUST_LEVELS.VERIFIED);
+    // Mark peerA's key as VERIFIED under peerA's fingerprint slot
+    client.verifyIdentity(peerAKey);
+    assert.equal(client.getTrustLevel(peerAKey), TRUST_LEVELS.VERIFIED);
 
-    // Simulate a different identity claiming the same fingerprint slot
-    // (i.e. a new key that maps to the same fingerprint bucket but whose
-    // stored identityPublicKey differs from the stored one)
-    const fp = fingerprintIdentityPublicKey(peerKey);
+    // Generate a genuinely different identity (different key material)
+    const peerB = generateIdentity();
+    const peerBKey = peerB.identityKeyPair.publicKey;
+
+    // Simulate MITM: store peerB's key in peerA's fingerprint slot
+    const fp = fingerprintIdentityPublicKey(peerAKey);
     const existingEntry = client.trustStore.get(fp);
+    client.trustStore.set(fp, { ...existingEntry, identityPublicKey: peerBKey });
 
-    // Manually corrupt the stored identityPublicKey to simulate key change
-    client.trustStore.set(fp, { ...existingEntry, identityPublicKey: `${peerKey}_TAMPERED` });
-
-    // Now checkAndUpdateTrust sees the original key ≠ stored tampered key
+    // Now checkAndUpdateTrust with peerA's original key sees a mismatch against the stored peerB key
     assert.throws(
-      () => client.checkAndUpdateTrust(peerKey),
+      () => client.checkAndUpdateTrust(peerAKey),
       /Security alert.*VERIFIED/,
     );
   } finally {
@@ -273,9 +273,8 @@ test('device fingerprints are tracked per TrustEntry', () => {
 
     assert.ok(entry.deviceFingerprints.length >= 2, 'both device fingerprints should be tracked');
 
-    const { createHash } = require('node:crypto');
-    const fp1 = createHash('sha256').update(deviceKey1).digest('hex');
-    const fp2 = createHash('sha256').update(deviceKey2).digest('hex');
+    const fp1 = client.fingerprintDevicePublicKey(deviceKey1);
+    const fp2 = client.fingerprintDevicePublicKey(deviceKey2);
     assert.ok(entry.deviceFingerprints.includes(fp1));
     assert.ok(entry.deviceFingerprints.includes(fp2));
   } finally {

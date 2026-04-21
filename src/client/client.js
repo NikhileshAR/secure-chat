@@ -1275,7 +1275,7 @@ class SecureClient {
         firstSeen: now,
         lastSeen: now,
         deviceFingerprints: devicePublicKey
-          ? [createHash('sha256').update(devicePublicKey).digest('hex')]
+          ? [this.fingerprintDevicePublicKey(devicePublicKey)]
           : [],
       };
       this.trustStore.set(fingerprint, entry);
@@ -1285,8 +1285,8 @@ class SecureClient {
     // CASE B: identity already seen – update lastSeen
     const updated = { ...existing, lastSeen: now };
 
-    // Check for identity key change (potential MITM)
-    if (!compareFingerprints(existing.identityPublicKey, identityPublicKey)) {
+    // Check for identity key change (potential MITM): direct PEM comparison
+    if (existing.identityPublicKey !== identityPublicKey) {
       updated.lastFingerprintChange = now;
 
       if (existing.level === TRUST_LEVELS.VERIFIED) {
@@ -1311,7 +1311,7 @@ class SecureClient {
 
     // Track device fingerprint
     if (devicePublicKey) {
-      const deviceFp = createHash('sha256').update(devicePublicKey).digest('hex');
+      const deviceFp = this.fingerprintDevicePublicKey(devicePublicKey);
       if (!updated.deviceFingerprints) {
         updated.deviceFingerprints = [];
       }
@@ -1322,6 +1322,16 @@ class SecureClient {
 
     this.trustStore.set(fingerprint, updated);
     return null;
+  }
+
+  /**
+   * Returns SHA-256 hex fingerprint of a device public key PEM.
+   *
+   * @param {string} devicePublicKeyPem
+   * @returns {string}
+   */
+  fingerprintDevicePublicKey(devicePublicKeyPem) {
+    return createHash('sha256').update(devicePublicKeyPem).digest('hex');
   }
 
   /**
