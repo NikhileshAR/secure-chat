@@ -11,6 +11,8 @@ const {
   verifyDeviceKeyBinding,
   fingerprintIdentityPublicKey,
   formatIdentityFingerprint,
+  compareFingerprints,
+  generateVerificationString,
 } = require('./identity');
 const {
   computeRouteTag,
@@ -29,6 +31,7 @@ const {
 const { validateMessage, PROTOCOL_VERSION } = require('../protocol/schema');
 const { SessionStore } = require('./storage/sessionStore');
 const { KeyVault } = require('./storage/keyVault');
+const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
 
 const REQUIRED_CHAT_FIELDS = [
   'type',
@@ -111,6 +114,8 @@ class SecureClient {
     keyVault,
     keyVaultStorageDir,
     deviceSecret,
+    trustStore,
+    trustStoreStorageDir,
     ackRetryIntervalMs = 2_000,
     ackMaxRetries = 5,
   }) {
@@ -219,9 +224,18 @@ class SecureClient {
       })
       : null);
     this.keyVault = keyVault || (keyVaultStorageDir ? new KeyVault({ storageDir: keyVaultStorageDir }) : null);
+    this.trustStore = trustStore || ((trustStoreStorageDir || sessionStorageDir) && deviceSecret
+      ? new TrustStore({
+        storageDir: trustStoreStorageDir || sessionStorageDir,
+        deviceSecret,
+      })
+      : null);
 
     if (this.sessionStore) {
       this.loadPersistedSessions();
+    }
+    if (this.trustStore) {
+      this.trustStore.loadTrust();
     }
   }
 
@@ -1060,6 +1074,14 @@ class SecureClient {
     const normalizedMessage = validateMessage(message);
     this.validateRequiredChatMessageFields(normalizedMessage);
 
+    // --- Trust enforcement (BEFORE decryption) ----------------------------
+    if (senderIdentityPublicKey) {
+      const trustResult = this.checkAndUpdateTrust(senderIdentityPublicKey, senderDevicePublicKey);
+      if (trustResult === 'BLOCKED') {
+        return null;
+      }
+    }
+
     if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
       throw new Error('Protocol violation: invalid message signature');
     }
@@ -1219,6 +1241,234 @@ class SecureClient {
       clearTimeout(this.autoPullTimer);
       this.autoPullTimer = null;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Trust & Identity Verification API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Core trust-enforcement logic called on every inbound message.
+   * Mutates the TrustStore entry as needed and throws / returns silently
+   * according to the enforcement rules.
+   *
+   * @param {string} identityPublicKey  PEM
+   * @param {string} [devicePublicKey]  PEM (optional – for device tracking)
+   * @throws if the identity is BLOCKED or a VERIFIED identity has changed key
+   * @returns {'BLOCKED'|null} 'BLOCKED' when the message must be silently dropped
+   */
+  checkAndUpdateTrust(identityPublicKey, devicePublicKey) {
+    if (!this.trustStore || !identityPublicKey) {
+      return null;
+    }
+
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const now = Date.now();
+    const existing = this.trustStore.get(fingerprint);
+
+    if (!existing) {
+      // CASE A: first time seeing this identity
+      const entry = {
+        identityPublicKey,
+        fingerprint,
+        level: TRUST_LEVELS.UNKNOWN,
+        firstSeen: now,
+        lastSeen: now,
+        deviceFingerprints: devicePublicKey
+          ? [createHash('sha256').update(devicePublicKey).digest('hex')]
+          : [],
+      };
+      this.trustStore.set(fingerprint, entry);
+      return null;
+    }
+
+    // CASE B: identity already seen – update lastSeen
+    const updated = { ...existing, lastSeen: now };
+
+    // Check for identity key change (potential MITM)
+    if (!compareFingerprints(existing.identityPublicKey, identityPublicKey)) {
+      updated.lastFingerprintChange = now;
+
+      if (existing.level === TRUST_LEVELS.VERIFIED) {
+        // Hard block – VERIFIED identity cannot silently change key
+        throw new Error(
+          'Security alert: identity key changed for a VERIFIED contact. '
+          + `Previous fingerprint: ${existing.fingerprint}. Message rejected.`,
+        );
+      }
+
+      // Downgrade trust to UNKNOWN for non-verified contacts
+      updated.level = TRUST_LEVELS.UNKNOWN;
+      updated.identityPublicKey = identityPublicKey;
+      updated.fingerprint = fingerprint;
+    }
+
+    // Enforce BLOCKED rule – return sentinel so caller can drop silently
+    if (updated.level === TRUST_LEVELS.BLOCKED) {
+      this.trustStore.set(fingerprint, updated);
+      return 'BLOCKED';
+    }
+
+    // Track device fingerprint
+    if (devicePublicKey) {
+      const deviceFp = createHash('sha256').update(devicePublicKey).digest('hex');
+      if (!updated.deviceFingerprints) {
+        updated.deviceFingerprints = [];
+      }
+      if (!updated.deviceFingerprints.includes(deviceFp)) {
+        updated.deviceFingerprints = [...updated.deviceFingerprints, deviceFp];
+      }
+    }
+
+    this.trustStore.set(fingerprint, updated);
+    return null;
+  }
+
+  /**
+   * Mark an identity as TRUSTED (user explicitly trusts it).
+   */
+  trustIdentity(identityPublicKey, label) {
+    if (!this.trustStore) {
+      throw new Error('TrustStore is not configured');
+    }
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const now = Date.now();
+    const existing = this.trustStore.get(fingerprint) || {
+      identityPublicKey,
+      fingerprint,
+      firstSeen: now,
+      deviceFingerprints: [],
+    };
+    this.trustStore.set(fingerprint, {
+      ...existing,
+      identityPublicKey,
+      fingerprint,
+      level: TRUST_LEVELS.TRUSTED,
+      lastSeen: now,
+      label: label !== undefined ? label : (existing.label || undefined),
+    });
+  }
+
+  /**
+   * Mark an identity as VERIFIED (safety-number / out-of-band confirmation).
+   */
+  verifyIdentity(identityPublicKey) {
+    if (!this.trustStore) {
+      throw new Error('TrustStore is not configured');
+    }
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const now = Date.now();
+    const existing = this.trustStore.get(fingerprint) || {
+      identityPublicKey,
+      fingerprint,
+      firstSeen: now,
+      deviceFingerprints: [],
+    };
+    this.trustStore.set(fingerprint, {
+      ...existing,
+      identityPublicKey,
+      fingerprint,
+      level: TRUST_LEVELS.VERIFIED,
+      lastSeen: now,
+      verifiedAt: now,
+    });
+  }
+
+  /**
+   * Block an identity – future messages from it will be silently dropped.
+   */
+  blockIdentity(identityPublicKey) {
+    if (!this.trustStore) {
+      throw new Error('TrustStore is not configured');
+    }
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const now = Date.now();
+    const existing = this.trustStore.get(fingerprint) || {
+      identityPublicKey,
+      fingerprint,
+      firstSeen: now,
+      deviceFingerprints: [],
+    };
+    this.trustStore.set(fingerprint, {
+      ...existing,
+      identityPublicKey,
+      fingerprint,
+      level: TRUST_LEVELS.BLOCKED,
+      lastSeen: now,
+    });
+  }
+
+  /**
+   * Remove a block, reverting the identity to UNKNOWN.
+   */
+  unblockIdentity(identityPublicKey) {
+    if (!this.trustStore) {
+      throw new Error('TrustStore is not configured');
+    }
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const existing = this.trustStore.get(fingerprint);
+    if (!existing) {
+      return;
+    }
+    this.trustStore.set(fingerprint, {
+      ...existing,
+      level: TRUST_LEVELS.UNKNOWN,
+      lastSeen: Date.now(),
+    });
+  }
+
+  /**
+   * Returns the current trust level string for an identity,
+   * or null if it has never been seen.
+   *
+   * @returns {string|null}
+   */
+  getTrustLevel(identityPublicKey) {
+    if (!this.trustStore) {
+      return null;
+    }
+    const fingerprint = fingerprintIdentityPublicKey(identityPublicKey);
+    const entry = this.trustStore.get(fingerprint);
+    return entry ? entry.level : null;
+  }
+
+  /**
+   * Returns all TrustEntry objects with level TRUSTED or VERIFIED.
+   *
+   * @returns {Array}
+   */
+  listTrustedIdentities() {
+    if (!this.trustStore) {
+      return [];
+    }
+    return this.trustStore.list().filter(
+      (e) => e.level === TRUST_LEVELS.TRUSTED || e.level === TRUST_LEVELS.VERIFIED,
+    );
+  }
+
+  /**
+   * Compares two identity fingerprints in a timing-safe manner.
+   *
+   * @param {string} fp1
+   * @param {string} fp2
+   * @returns {boolean}
+   */
+  compareFingerprints(fp1, fp2) {
+    return compareFingerprints(fp1, fp2);
+  }
+
+  /**
+   * Generate a verification string (Safety-Number style) for out-of-band
+   * identity confirmation between this client and a peer.
+   *
+   * @param {string} peerIdentityPublicKey  PEM
+   * @returns {{ numeric: string, words: string[] }}
+   */
+  generateVerificationString(peerIdentityPublicKey) {
+    return generateVerificationString(
+      this.identity.identityKeyPair.publicKey,
+      peerIdentityPublicKey,
+    );
   }
 
   close() {
