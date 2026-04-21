@@ -26,6 +26,9 @@ const {
   encryptPayloadWithMessageKey,
   decryptPayloadWithMessageKey,
 } = require('./crypto');
+const { validateMessage, PROTOCOL_VERSION } = require('../protocol/schema');
+const { SessionStore } = require('./storage/sessionStore');
+const { KeyVault } = require('./storage/keyVault');
 
 const REQUIRED_CHAT_FIELDS = [
   'type',
@@ -103,6 +106,13 @@ class SecureClient {
     trafficSmoothingVariance = DEFAULT_SMOOTHING_VARIANCE,
     normalizedPullRouteTagCount,
     decoySessionCount = 0,
+    sessionStore,
+    sessionStorageDir,
+    keyVault,
+    keyVaultStorageDir,
+    deviceSecret,
+    ackRetryIntervalMs = 2_000,
+    ackMaxRetries = 5,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -194,6 +204,144 @@ class SecureClient {
     this.autoPullBaseIntervalMs = 0;
     this.pullNoiseSeed = randomBytes(32).toString('hex');
     this.pullNoiseCounter = 0;
+    this.protocolVersion = PROTOCOL_VERSION;
+    this.pendingAcks = new Map();
+    this.ackRetryIntervalMs = Math.max(250, Number(ackRetryIntervalMs) || 2_000);
+    this.ackMaxRetries = Math.max(1, Number(ackMaxRetries) || 5);
+    this.ackRetryTimer = null;
+
+    this.sessionStore = sessionStore || (sessionStorageDir && deviceSecret
+      ? new SessionStore({
+        storageDir: sessionStorageDir,
+        deviceSecret,
+        maxSkippedMessageKeys: this.maxSkippedMessageKeys,
+        ttlMs: this.sessionTtlMs,
+      })
+      : null);
+    this.keyVault = keyVault || (keyVaultStorageDir ? new KeyVault({ storageDir: keyVaultStorageDir }) : null);
+
+    if (this.sessionStore) {
+      this.loadPersistedSessions();
+    }
+  }
+
+  loadPersistedSessions() {
+    try {
+      const loaded = this.sessionStore.loadSessions();
+      if (loaded instanceof Map) {
+        this.sessions = loaded;
+      }
+    } catch (error) {
+      this.sessions = new Map();
+      void error;
+    }
+  }
+
+  persistSessions() {
+    if (!this.sessionStore) {
+      return;
+    }
+    this.sessionStore.saveSessions(this.sessions);
+  }
+
+  startAckRetryLoop() {
+    if (this.ackRetryTimer || !this.socket) {
+      return;
+    }
+    this.ackRetryTimer = setInterval(() => {
+      this.retryUnackedMessages();
+    }, this.ackRetryIntervalMs);
+  }
+
+  stopAckRetryLoop() {
+    if (this.ackRetryTimer) {
+      clearInterval(this.ackRetryTimer);
+      this.ackRetryTimer = null;
+    }
+  }
+
+  lockPrivateKeys(passphrase, options = {}) {
+    if (!this.keyVault) {
+      throw new Error('Key vault is not configured');
+    }
+    this.keyVault.lockKeys({
+      identityPrivateKey: this.identity.identityKeyPair.privateKey,
+      devicePrivateKey: this.identity.deviceKeyPair.privateKey,
+    }, passphrase, options);
+  }
+
+  unlockPrivateKeys(passphrase) {
+    if (!this.keyVault) {
+      throw new Error('Key vault is not configured');
+    }
+    const unlocked = this.keyVault.unlock(passphrase);
+    this.identity = {
+      ...this.identity,
+      identityKeyPair: {
+        ...this.identity.identityKeyPair,
+        privateKey: unlocked.identityPrivateKey,
+      },
+      deviceKeyPair: {
+        ...this.identity.deviceKeyPair,
+        privateKey: unlocked.devicePrivateKey,
+      },
+    };
+    return unlocked;
+  }
+
+  trackAck(envelope) {
+    this.pendingAcks.set(envelope.messageId, {
+      envelope,
+      attempts: 0,
+      lastAttemptAt: Date.now(),
+    });
+  }
+
+  retryUnackedMessages() {
+    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
+      return;
+    }
+    const now = Date.now();
+    for (const [ackId, pending] of this.pendingAcks.entries()) {
+      if (pending.attempts >= this.ackMaxRetries) {
+        this.pendingAcks.delete(ackId);
+        continue;
+      }
+      if (now - pending.lastAttemptAt < this.ackRetryIntervalMs) {
+        continue;
+      }
+      pending.attempts += 1;
+      pending.lastAttemptAt = now;
+      this.sendRaw({ ...pending.envelope, deliveredAt: undefined });
+    }
+  }
+
+  acknowledgeDelivery(message) {
+    if (!message?.messageId) {
+      return;
+    }
+    const ack = {
+      type: 'ack',
+      protocolVersion: this.protocolVersion,
+      ackId: message.messageId,
+      senderDeviceId: this.identity.deviceId,
+      targetDeviceId: message.senderDeviceId,
+      routeTag: message.routeTag,
+      deliveredAt: Date.now(),
+      encryptedPayload: '',
+      timestamp: Date.now(),
+    };
+    this.sendRaw(ack);
+  }
+
+  receiveAck(message) {
+    const normalized = validateMessage(message);
+    if (normalized.type !== 'ack') {
+      return;
+    }
+    if (normalized.ackId) {
+      this.pendingAcks.delete(normalized.ackId);
+    }
   }
 
   async connect() {
@@ -206,6 +354,7 @@ class SecureClient {
 
     this.sendRaw({
       type: 'handshake',
+      protocolVersion: this.protocolVersion,
       senderDeviceId: this.identity.deviceId,
       timestamp: Date.now(),
       encryptedPayload: '',
@@ -218,6 +367,7 @@ class SecureClient {
         postQuantumDevice: this.postQuantumPublicKey,
       },
     });
+    this.startAckRetryLoop();
     this.startCoverTraffic();
   }
 
@@ -225,7 +375,12 @@ class SecureClient {
     if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
       throw new Error('Client is not connected');
     }
-    this.socket.send(`${JSON.stringify(message)}\n`);
+    const withVersion = {
+      protocolVersion: this.protocolVersion,
+      ...message,
+    };
+    validateMessage(withVersion);
+    this.socket.send(`${JSON.stringify(withVersion)}\n`);
   }
 
   randomInRange({ min, max }) {
@@ -380,6 +535,7 @@ class SecureClient {
         this.sessions.delete(sessionId);
       } else {
         this.touchSession(existing, now);
+        this.persistSessions();
         return existing;
       }
     }
@@ -417,6 +573,7 @@ class SecureClient {
     };
 
     this.sessions.set(sessionId, session);
+    this.persistSessions();
     return session;
   }
 
@@ -491,22 +648,9 @@ class SecureClient {
   }
 
   validateRequiredChatMessageFields(message) {
-    for (const field of REQUIRED_CHAT_FIELDS) {
-      if (message[field] === undefined || message[field] === null) {
-        throw new Error(`Protocol violation: missing required field ${field}`);
-      }
-    }
-    if (message.type !== 'chat') {
+    const normalized = validateMessage(message);
+    if (normalized.type !== 'chat') {
       throw new Error('Protocol violation: invalid message type');
-    }
-    if (!Number.isInteger(message.counter) || message.counter < 0) {
-      throw new Error('Protocol violation: invalid counter');
-    }
-    if (!Number.isInteger(message.previousCounter) || message.previousCounter < 0) {
-      throw new Error('Protocol violation: invalid previousCounter');
-    }
-    if (!Number.isFinite(message.timestamp) || message.timestamp <= 0) {
-      throw new Error('Protocol violation: invalid timestamp');
     }
   }
 
@@ -545,7 +689,9 @@ class SecureClient {
 
     const baseMessage = {
       type: 'chat',
+      protocolVersion: this.protocolVersion,
       senderDeviceId: this.identity.deviceId,
+      targetDeviceId: recipientDeviceId,
       routeTag,
       messageId,
       counter,
@@ -558,7 +704,26 @@ class SecureClient {
     const signature = signMessage(this.identity.identityKeyPair.privateKey, baseMessage);
     const envelope = { ...baseMessage, signature };
     this.queueOutboundMessage(envelope, { sessionId: this.getSessionId({ peerDeviceId: recipientDeviceId, peerDevicePublicKey: recipientDevicePublicKey, routeSecret }) });
+    this.trackAck(envelope);
+    this.persistSessions();
     return envelope;
+  }
+
+  sendChatToIdentityDevices({
+    content,
+    recipientIdentity,
+    routeSecretByDevice = {},
+    attachments,
+  }) {
+    const entries = Object.entries(recipientIdentity?.deviceRegistry || {});
+    return entries.map(([recipientDeviceId, record]) => this.sendChat({
+      content,
+      attachments,
+      recipientDeviceId,
+      recipientDevicePublicKey: record.devicePublicKey,
+      recipientIdentityPublicKey: recipientIdentity.identityKeyPair?.publicKey,
+      routeSecret: routeSecretByDevice[recipientDeviceId] || routeSecretByDevice.default,
+    }));
   }
 
   computeMixDelayMs() {
@@ -781,7 +946,9 @@ class SecureClient {
 
     const baseMessage = {
       type: 'chat',
+      protocolVersion: this.protocolVersion,
       senderDeviceId: this.identity.deviceId,
+      targetDeviceId: session.peerDeviceId,
       routeTag,
       messageId,
       counter,
@@ -791,6 +958,7 @@ class SecureClient {
       timestamp: Date.now(),
     };
     const signature = signMessage(this.identity.identityKeyPair.privateKey, baseMessage);
+    this.persistSessions();
     return { ...baseMessage, signature };
   }
 
@@ -885,39 +1053,42 @@ class SecureClient {
   }
 
   decryptChat({ message, senderDevicePublicKey, senderIdentityPublicKey, routeSecret }) {
-    this.validateRequiredChatMessageFields(message);
+    const normalizedMessage = validateMessage(message);
+    this.validateRequiredChatMessageFields(normalizedMessage);
 
-    if (!verifyMessage(senderIdentityPublicKey, message, message.signature)) {
+    if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
       throw new Error('Protocol violation: invalid message signature');
     }
 
     const session = this.ensureSession({
-      peerDeviceId: message.senderDeviceId,
+      peerDeviceId: normalizedMessage.senderDeviceId,
       peerIdentityPublicKey: senderIdentityPublicKey,
       peerDevicePublicKey: senderDevicePublicKey,
       routeSecret,
     });
 
     this.pruneSeenMessageIds(session.seenMessageIds);
-    if (session.seenMessageIds.has(message.messageId)) {
+    if (session.seenMessageIds.has(normalizedMessage.messageId)) {
       return null;
     }
-    session.seenMessageIds.set(message.messageId, Date.now() + this.replayTtlMs);
+    session.seenMessageIds.set(normalizedMessage.messageId, Date.now() + this.replayTtlMs);
 
-    this.applyReceiveRatchetIfNeeded(session, message.dhPublicKey);
+    this.applyReceiveRatchetIfNeeded(session, normalizedMessage.dhPublicKey);
 
-    const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, message.counter, 'send');
-    if (!expectedRouteTags.includes(message.routeTag)) {
+    const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
+    if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
       throw new Error('Protocol violation: routeTag mismatch');
     }
 
-    const messageKey = this.deriveReceiveMessageKey(session, message);
+    const messageKey = this.deriveReceiveMessageKey(session, normalizedMessage);
     this.touchSession(session);
+    this.persistSessions();
 
-    const payload = decryptPayloadWithMessageKey(JSON.parse(message.encryptedPayload), messageKey);
+    const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
     if (payload?.isDummy) {
       return null;
     }
+    this.acknowledgeDelivery(normalizedMessage);
     return payload;
   }
 
@@ -937,6 +1108,18 @@ class SecureClient {
 
   decryptChatWithDelay(params) {
     return this.delayInboundProcessing(() => this.decryptChat(params));
+  }
+
+  handleInboundMessage(params) {
+    const normalized = validateMessage(params.message);
+    if (normalized.type === 'ack') {
+      this.receiveAck(normalized);
+      return null;
+    }
+    if (normalized.type === 'chat') {
+      return this.decryptChat({ ...params, message: normalized });
+    }
+    return null;
   }
 
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
@@ -1041,6 +1224,8 @@ class SecureClient {
     }
     this.stopCoverTraffic();
     this.stopAutoPull();
+    this.stopAckRetryLoop();
+    this.persistSessions();
     if (this.socket) {
       this.socket.close();
       this.socket = null;

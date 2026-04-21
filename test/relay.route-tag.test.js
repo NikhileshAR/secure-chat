@@ -224,3 +224,45 @@ test('relay delivers padded envelopes in shuffled/batched responses without decr
   receiver.close();
   server.stop();
 });
+
+test('relay remains stable under burst flood with bounded storage', async () => {
+  const port = 9900 + Math.floor(Math.random() * 200);
+  const server = new RelayServer({
+    host: '127.0.0.1',
+    port,
+    messageTtlMs: 10_000,
+    maxMessagesPerRouteTag: 40,
+    maxTotalMessages: 120,
+    maxConcurrentConnections: 100,
+    maxBufferedBytes: 256 * 1024,
+  });
+  server.start();
+
+  const sender = await openSocket(`ws://127.0.0.1:${port}`);
+  sender.send(`${JSON.stringify({
+    type: 'handshake',
+    protocolVersion: '1.0',
+    senderDeviceId: 'sender-flood',
+    encryptedPayload: '',
+    timestamp: Date.now(),
+  })}\n`);
+  const routeTag = computeRouteTag('flood-route', 0);
+
+  for (let i = 0; i < 500; i += 1) {
+    sender.send(`${JSON.stringify({
+      type: 'chat',
+      protocolVersion: '1.0',
+      senderDeviceId: 'sender-flood',
+      routeTag,
+      messageId: `flood-${i}`,
+      counter: i,
+      encryptedPayload: 'ciphertext',
+      timestamp: Date.now(),
+      signature: 'sig',
+    })}\n`);
+  }
+
+  assert.ok(server.totalStoredMessages() <= 120);
+  sender.close();
+  server.stop();
+});
