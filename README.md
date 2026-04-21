@@ -9,6 +9,9 @@ Privacy-first self-hosted communication baseline implementation.
 - End-to-end payload encryption/decryption helpers (`src/client/crypto.js`)
 - Client handshake + encrypted chat + routeTag pull flow (`src/client/client.js`)
 - RouteTag-based ephemeral relay buffering with TTL expiry
+- Strict protocol schema + versioning validation (`src/protocol/schema.js`)
+- Encrypted session persistence and key vault storage (`src/client/storage/*`)
+- Multi-device registry linking and ACK-aware delivery retries
 
 ## Run relay server
 

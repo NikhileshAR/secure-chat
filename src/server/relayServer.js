@@ -1,5 +1,10 @@
 const { WebSocketServer } = require('ws');
 const { createHash } = require('node:crypto');
+const {
+  normalizeControlMessage,
+  ensureProtocolVersion,
+  PROTOCOL_VERSION,
+} = require('../protocol/schema');
 
 class RelayServer {
   constructor({
@@ -15,6 +20,9 @@ class RelayServer {
     connectionRateLimit = { windowMs: 1_000, maxMessages: 300 },
     relayBatchSize = 50,
     shuffleDelivery = true,
+    maxConcurrentConnections = 1_000,
+    maxBufferedBytes = 512 * 1024,
+    maxPullRouteTags = 2_048,
   } = {}) {
     this.host = host;
     this.port = port;
@@ -28,6 +36,9 @@ class RelayServer {
     this.connectionRateLimit = connectionRateLimit;
     this.relayBatchSize = Math.max(1, Number(relayBatchSize) || 50);
     this.shuffleDelivery = Boolean(shuffleDelivery);
+    this.maxConcurrentConnections = Math.max(1, Number(maxConcurrentConnections) || 1_000);
+    this.maxBufferedBytes = Math.max(32 * 1024, Number(maxBufferedBytes) || 512 * 1024);
+    this.maxPullRouteTags = Math.max(1, Number(maxPullRouteTags) || 2_048);
 
     this.connections = new Map();
     this.routeStore = new Map();
@@ -46,6 +57,10 @@ class RelayServer {
 
     this.wss = new WebSocketServer({ host: this.host, port: this.port });
     this.wss.on('connection', (socket) => {
+      if (this.wss.clients.size > this.maxConcurrentConnections) {
+        socket.close();
+        return;
+      }
       socket.on('message', (data) => this.handleMessage(socket, data.toString()));
       socket.on('close', () => this.cleanupSocket(socket));
     });
@@ -117,7 +132,9 @@ class RelayServer {
 
       let message;
       try {
-        message = JSON.parse(line);
+        const parsedLine = JSON.parse(line);
+        const normalizedMessage = normalizeControlMessage(parsedLine);
+        message = ensureProtocolVersion(normalizedMessage);
       } catch {
         const invalidCount = (this.invalidMessageCounts.get(socket) || 0) + 1;
         this.invalidMessageCounts.set(socket, invalidCount);
@@ -145,7 +162,18 @@ class RelayServer {
         continue;
       }
 
-      if (message.type === 'chat') {
+      if (message.type === 'chat' || message.type === 'ack') {
+        if (typeof message.senderDeviceId !== 'string' || typeof message.encryptedPayload !== 'string') {
+          continue;
+        }
+        if (
+          message.senderDeviceId.length > 512
+          || message.encryptedPayload.length > this.maxMessageSizeBytes
+          || (typeof message.messageId === 'string' && message.messageId.length > 512)
+          || (typeof message.routeTag === 'string' && message.routeTag.length > 4096)
+        ) {
+          continue;
+        }
         if (message.routeTag) {
           const routeOk = this.checkRateLimit(
             this.routeTagMessageRates,
@@ -161,12 +189,20 @@ class RelayServer {
 
         const target = message.targetDeviceId && this.connections.get(message.targetDeviceId);
         if (target && target.readyState === target.OPEN) {
+          if (target.bufferedAmount > this.maxBufferedBytes) {
+            target.close();
+            continue;
+          }
           target.send(`${JSON.stringify(message)}\n`);
         }
         continue;
       }
 
-      if (message.type === 'control' && message.action === 'pull') {
+      if (message.type === 'pull') {
+        if ((message.routeTags || []).length > this.maxPullRouteTags) {
+          socket.close();
+          return;
+        }
         this.flushRouteTags(socket, message.routeTags || []);
       }
     }
@@ -214,11 +250,16 @@ class RelayServer {
 
     const totalBatches = Math.max(1, Math.ceil(matches.length / this.relayBatchSize));
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+      if (socket.bufferedAmount > this.maxBufferedBytes) {
+        socket.close();
+        break;
+      }
       const start = batchIndex * this.relayBatchSize;
       const batchMessages = matches.slice(start, start + this.relayBatchSize);
       socket.send(`${JSON.stringify({
         type: 'control',
         action: 'deliver',
+        protocolVersion: PROTOCOL_VERSION,
         encryptedPayload: JSON.stringify({
           messages: batchMessages,
           batchIndex,

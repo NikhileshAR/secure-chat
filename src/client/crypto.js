@@ -10,6 +10,7 @@ const {
   sign,
   verify,
 } = require('node:crypto');
+const { canonicalSerialize } = require('../protocol/schema');
 
 const ROUTE_COUNTER_SIZE = 8;
 const ROOT_KEY_SIZE = 32;
@@ -259,6 +260,7 @@ function deriveNextChainKey(chainKey) {
 
 function createMessageSignaturePayload(messageObject) {
   const required = [
+    'protocolVersion',
     'messageId',
     'counter',
     'previousCounter',
@@ -271,7 +273,8 @@ function createMessageSignaturePayload(messageObject) {
       throw new Error(`Missing signature field: ${field}`);
     }
   }
-  return {
+  const payload = {
+    protocolVersion: messageObject.protocolVersion,
     messageId: messageObject.messageId,
     counter: messageObject.counter,
     previousCounter: messageObject.previousCounter,
@@ -279,15 +282,25 @@ function createMessageSignaturePayload(messageObject) {
     encryptedPayload: messageObject.encryptedPayload,
     timestamp: messageObject.timestamp,
   };
+  if (messageObject.ackId !== undefined) {
+    payload.ackId = messageObject.ackId;
+  }
+  if (messageObject.deliveredAt !== undefined) {
+    payload.deliveredAt = messageObject.deliveredAt;
+  }
+  if (messageObject.targetDeviceId !== undefined) {
+    payload.targetDeviceId = messageObject.targetDeviceId;
+  }
+  return payload;
 }
 
 function signMessage(identityPrivateKeyPem, messageObject) {
-  const payload = Buffer.from(JSON.stringify(createMessageSignaturePayload(messageObject)));
+  const payload = Buffer.from(canonicalSerialize(createMessageSignaturePayload(messageObject)));
   return sign(null, payload, createPrivateKey(identityPrivateKeyPem)).toString('base64');
 }
 
 function verifyMessage(identityPublicKeyPem, messageObject, signature) {
-  const payload = Buffer.from(JSON.stringify(createMessageSignaturePayload(messageObject)));
+  const payload = Buffer.from(canonicalSerialize(createMessageSignaturePayload(messageObject)));
   return verify(null, payload, createPublicKey(identityPublicKeyPem), Buffer.from(signature, 'base64'));
 }
 
