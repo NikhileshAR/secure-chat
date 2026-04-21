@@ -33,6 +33,12 @@ function toBuffer(value) {
   return Buffer.from(String(value));
 }
 
+function zeroizeBuffer(value) {
+  if (Buffer.isBuffer(value)) {
+    value.fill(0);
+  }
+}
+
 function encodeCounter(counter) {
   if (!Number.isSafeInteger(counter) || counter < 0) {
     throw new Error('Counter must be a non-negative integer');
@@ -207,12 +213,18 @@ function encryptPayload(payload, senderDevicePrivateKeyPem, recipientDevicePubli
   const senderPrivateKey = createPrivateKey(senderDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: senderPrivateKey, publicKey: recipientPublicKey });
   const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', MESSAGE_KEY_SIZE);
-  const paddedPayload = encodePaddedPayload(payloadBytes, options);
-  const encryptedPayload = encryptAesGcm(paddedPayload, messageKey);
+  try {
+    const paddedPayload = encodePaddedPayload(payloadBytes, options);
+    const encryptedPayload = encryptAesGcm(paddedPayload, messageKey);
 
-  return {
-    encryptedPayload,
-  };
+    return {
+      encryptedPayload,
+    };
+  } finally {
+    zeroizeBuffer(sharedSecret);
+    zeroizeBuffer(messageKey);
+    zeroizeBuffer(payloadBytes);
+  }
 }
 
 function decryptPayload(encryptedMessage, recipientDevicePrivateKeyPem, senderDevicePublicKeyPem) {
@@ -220,24 +232,40 @@ function decryptPayload(encryptedMessage, recipientDevicePrivateKeyPem, senderDe
   const recipientPrivateKey = createPrivateKey(recipientDevicePrivateKeyPem);
   const sharedSecret = diffieHellman({ privateKey: recipientPrivateKey, publicKey: senderPublicKey });
   const messageKey = hkdfSha512(sharedSecret, 'secure-msg-key', MESSAGE_KEY_SIZE);
-  const decryptedPayload = decodePaddedPayload(decryptAesGcm(encryptedMessage.encryptedPayload, messageKey));
-  return JSON.parse(decryptedPayload.toString('utf8'));
+  let decryptedPayload;
+  try {
+    decryptedPayload = decodePaddedPayload(decryptAesGcm(encryptedMessage.encryptedPayload, messageKey));
+    return JSON.parse(decryptedPayload.toString('utf8'));
+  } finally {
+    zeroizeBuffer(sharedSecret);
+    zeroizeBuffer(messageKey);
+    zeroizeBuffer(decryptedPayload);
+  }
 }
 
 function encryptPayloadWithMessageKey(payload, messageKey, options = {}) {
   const payloadBytes = Buffer.from(JSON.stringify(payload));
-  const { paddingSizeBuckets, ...cipherOptions } = options;
-  const paddedPayload = encodePaddedPayload(payloadBytes, { paddingSizeBuckets });
-  return {
-    encryptedPayload: encryptAesGcm(paddedPayload, messageKey, cipherOptions),
-  };
+  try {
+    const { paddingSizeBuckets, ...cipherOptions } = options;
+    const paddedPayload = encodePaddedPayload(payloadBytes, { paddingSizeBuckets });
+    return {
+      encryptedPayload: encryptAesGcm(paddedPayload, messageKey, cipherOptions),
+    };
+  } finally {
+    zeroizeBuffer(payloadBytes);
+  }
 }
 
 function decryptPayloadWithMessageKey(encryptedMessage, messageKey) {
-  const decryptedPayload = decodePaddedPayload(
-    decryptAesGcm(encryptedMessage.encryptedPayload, messageKey),
-  );
-  return JSON.parse(decryptedPayload.toString('utf8'));
+  let decryptedPayload;
+  try {
+    decryptedPayload = decodePaddedPayload(
+      decryptAesGcm(encryptedMessage.encryptedPayload, messageKey),
+    );
+    return JSON.parse(decryptedPayload.toString('utf8'));
+  } finally {
+    zeroizeBuffer(decryptedPayload);
+  }
 }
 
 function deriveSharedSecret(senderDevicePrivateKeyPem, recipientDevicePublicKeyPem) {
@@ -325,4 +353,5 @@ module.exports = {
   createMessageSignaturePayload,
   signMessage,
   verifyMessage,
+  zeroizeBuffer,
 };

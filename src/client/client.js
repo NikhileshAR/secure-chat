@@ -32,6 +32,14 @@ const { validateMessage, PROTOCOL_VERSION } = require('../protocol/schema');
 const { SessionStore } = require('./storage/sessionStore');
 const { KeyVault } = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
+const {
+  SecurityState,
+  IDENTITY_INTEGRITY,
+  TRUST_LEVEL,
+  SESSION_HEALTH,
+  ENVIRONMENT_RISK,
+} = require('./securityState');
+const { SecurityLog } = require('./securityLog');
 
 const REQUIRED_CHAT_FIELDS = [
   'type',
@@ -61,6 +69,16 @@ const DEFAULT_INBOUND_DELAY_RANGE_MS = { min: 5, max: 35 };
 const DEFAULT_SMOOTHING_WINDOW_MS = 5_000;
 const DEFAULT_SMOOTHING_VARIANCE = 0.15;
 const DECOY_SESSION_PREFIX = '_decoy_session:';
+const DEFAULT_QUARANTINE_LIMIT = 128;
+const DEFAULT_SAFE_MODE_THRESHOLDS = {
+  handshakeMismatches: 3,
+  routeTagMismatchSpike: 8,
+  invalidSignatureRate: 8,
+  relayFloodRate: 80,
+  burstAnomalyRate: 25,
+  windowMs: 10_000,
+};
+const DEFAULT_LONG_INACTIVITY_MS = 5 * 60_000;
 
 function normalizeRange(range, fallback) {
   const min = Number(range?.min ?? fallback.min);
@@ -118,6 +136,13 @@ class SecureClient {
     trustStoreStorageDir,
     ackRetryIntervalMs = 2_000,
     ackMaxRetries = 5,
+    securityState,
+    securityLog,
+    securityLogStorageDir,
+    securityLogPersistenceEnabled = false,
+    maxQuarantineMessages = DEFAULT_QUARANTINE_LIMIT,
+    safeModeThresholds = DEFAULT_SAFE_MODE_THRESHOLDS,
+    longInactivityMs = DEFAULT_LONG_INACTIVITY_MS,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -214,6 +239,25 @@ class SecureClient {
     this.ackRetryIntervalMs = Math.max(250, Number(ackRetryIntervalMs) || 2_000);
     this.ackMaxRetries = Math.max(1, Number(ackMaxRetries) || 5);
     this.ackRetryTimer = null;
+    this.lastActivityAt = Date.now();
+    this.longInactivityMs = Math.max(10_000, Number(longInactivityMs) || DEFAULT_LONG_INACTIVITY_MS);
+    this.maxQuarantineMessages = Math.max(1, Number(maxQuarantineMessages) || DEFAULT_QUARANTINE_LIMIT);
+    this.quarantineQueue = [];
+    this.safeMode = false;
+    this.safeModeSince = null;
+    this.safeModeReason = null;
+    this.safeModeManualResumeRequired = false;
+    this.securityThresholds = {
+      ...DEFAULT_SAFE_MODE_THRESHOLDS,
+      ...(safeModeThresholds || {}),
+    };
+    this.handshakeMismatchCount = 0;
+    this.routeTagMismatchTimestamps = [];
+    this.invalidSignatureTimestamps = [];
+    this.replayAttemptTimestamps = [];
+    this.counterGapTimestamps = [];
+    this.droppedMessageTimestamps = [];
+    this.inboundBurstTimestamps = [];
 
     this.sessionStore = sessionStore || (sessionStorageDir && deviceSecret
       ? new SessionStore({
@@ -230,6 +274,18 @@ class SecureClient {
         deviceSecret,
       })
       : null);
+    this.securityState = securityState || new SecurityState();
+    this.securityLog = securityLog || new SecurityLog({
+      storageDir: securityLogStorageDir || trustStoreStorageDir || sessionStorageDir,
+      deviceSecret,
+      persistenceEnabled: securityLogPersistenceEnabled,
+    });
+    this.maxSkippedMessageKeys = Math.max(8, Math.min(this.maxSkippedMessageKeys, 128));
+    this.securityStateUnsubscribe = this.securityState.subscribe((state) => {
+      if (state.sessionHealth !== SESSION_HEALTH.SUSPECT) {
+        this.retryQuarantinedMessages();
+      }
+    });
 
     if (this.sessionStore) {
       this.loadPersistedSessions();
@@ -244,6 +300,18 @@ class SecureClient {
       const loaded = this.sessionStore.loadSessions();
       if (loaded instanceof Map) {
         this.sessions = loaded;
+        for (const session of this.sessions.values()) {
+          session.ratchetPending = true;
+          if (session.skippedMessageKeys?.size) {
+            for (const key of session.skippedMessageKeys.values()) {
+              this.zeroizeBuffer(key);
+            }
+            session.skippedMessageKeys.clear();
+          }
+        }
+        this.recordSecurityEvent('session_restored_from_disk', {
+          sessionCount: this.sessions.size,
+        });
       }
     } catch (error) {
       this.sessions = new Map();
@@ -258,6 +326,109 @@ class SecureClient {
       return;
     }
     this.sessionStore.saveSessions(this.sessions);
+  }
+
+  zeroizeBuffer(value) {
+    if (Buffer.isBuffer(value)) {
+      value.fill(0);
+    }
+  }
+
+  now() {
+    return Date.now();
+  }
+
+  trimTimestamps(timestamps, now = this.now()) {
+    const windowMs = Math.max(1000, Number(this.securityThresholds.windowMs) || 10_000);
+    while (timestamps.length && now - timestamps[0] > windowMs) {
+      timestamps.shift();
+    }
+  }
+
+  noteTimestamp(timestamps, now = this.now()) {
+    timestamps.push(now);
+    this.trimTimestamps(timestamps, now);
+    return timestamps.length;
+  }
+
+  recordSecurityEvent(eventType, details = {}, stateEvent = null) {
+    if (this.securityLog) {
+      this.securityLog.append(eventType, details);
+    }
+    if (stateEvent) {
+      this.securityState.updateState(stateEvent);
+    }
+  }
+
+  evaluateBurstAnomaly(now = this.now()) {
+    const count = this.noteTimestamp(this.inboundBurstTimestamps, now);
+    if (count >= this.securityThresholds.burstAnomalyRate) {
+      this.enterSafeMode('abnormal timing patterns');
+    }
+  }
+
+  enterSafeMode(reason) {
+    if (this.safeMode) {
+      return;
+    }
+    this.safeMode = true;
+    this.safeModeSince = this.now();
+    this.safeModeReason = reason;
+    this.safeModeManualResumeRequired = true;
+    this.stopAutoPull();
+    this.recordSecurityEvent('safe_mode_triggered', { reason }, {
+      type: 'safe_mode_triggered',
+      environmentRisk: ENVIRONMENT_RISK.HIGH,
+      sessionHealth: SESSION_HEALTH.SUSPECT,
+      timestamp: this.safeModeSince,
+    });
+  }
+
+  resumeFromSafeMode() {
+    if (!this.safeMode) {
+      return false;
+    }
+    this.safeMode = false;
+    this.safeModeReason = null;
+    this.safeModeManualResumeRequired = false;
+    this.securityState.updateState({
+      type: 'manual_resume',
+      timestamp: this.now(),
+      sessionHealth: SESSION_HEALTH.HEALTHY,
+      environmentRisk: ENVIRONMENT_RISK.MEDIUM,
+    });
+    this.retryQuarantinedMessages();
+    return true;
+  }
+
+  enqueueQuarantine(params) {
+    this.quarantineQueue.push({
+      params,
+      queuedAt: this.now(),
+      attempts: 0,
+    });
+    if (this.quarantineQueue.length > this.maxQuarantineMessages) {
+      this.quarantineQueue.shift();
+    }
+  }
+
+  retryQuarantinedMessages() {
+    if (!this.quarantineQueue.length || this.safeMode) {
+      return;
+    }
+    const pending = [...this.quarantineQueue];
+    this.quarantineQueue = [];
+    for (const item of pending) {
+      try {
+        this.decryptChatInternal(item.params, { allowQuarantine: false, acknowledge: true });
+      } catch (error) {
+        item.attempts += 1;
+        if (item.attempts < 2) {
+          this.quarantineQueue.push(item);
+        }
+        this.recordSecurityEvent('quarantine_retry_failed', { reason: error.message });
+      }
+    }
   }
 
   startAckRetryLoop() {
@@ -385,6 +556,10 @@ class SecureClient {
         postQuantumDevice: this.postQuantumPublicKey,
       },
     });
+    for (const session of this.sessions.values()) {
+      session.ratchetPending = true;
+    }
+    this.recordSecurityEvent('reconnect_force_ratchet', { sessionCount: this.sessions.size });
     this.startAckRetryLoop();
     this.startCoverTraffic();
   }
@@ -631,6 +806,7 @@ class SecureClient {
       if (next.done) {
         break;
       }
+      this.zeroizeBuffer(session.skippedMessageKeys.get(next.value));
       session.skippedMessageKeys.delete(next.value);
     }
   }
@@ -656,6 +832,14 @@ class SecureClient {
     const newDhKeyPair = this.createDhKeyPair();
     const newSharedSecret = deriveSharedSecret(newDhKeyPair.privateKey, session.lastDHKey);
     const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    this.zeroizeBuffer(session.rootKey);
+    this.zeroizeBuffer(session.chainKeySend);
+    if (session.skippedMessageKeys?.size) {
+      for (const key of session.skippedMessageKeys.values()) {
+        this.zeroizeBuffer(key);
+      }
+      session.skippedMessageKeys.clear();
+    }
 
     session.previousCounter = session.sendCounter;
     session.sendCounter = 0;
@@ -680,12 +864,21 @@ class SecureClient {
     routeSecret,
     attachments,
   }) {
+    if (this.safeMode) {
+      this.sendDummyTraffic();
+      this.recordSecurityEvent('safe_mode_blocked_real_send', { recipientDeviceId });
+      return null;
+    }
     const session = this.ensureSession({
       peerDeviceId: recipientDeviceId,
       peerIdentityPublicKey: recipientIdentityPublicKey,
       peerDevicePublicKey: recipientDevicePublicKey,
       routeSecret,
     });
+    if (this.now() - this.lastActivityAt >= this.longInactivityMs) {
+      session.ratchetPending = true;
+      this.recordSecurityEvent('long_inactivity_force_ratchet', { recipientDeviceId });
+    }
 
     this.maybeRatchetSendChain(session);
 
@@ -701,9 +894,13 @@ class SecureClient {
       { paddingSizeBuckets: this.paddingSizeBuckets },
     );
 
+    const previousChainKey = session.chainKeySend;
     session.chainKeySend = deriveNextChainKey(session.chainKeySend);
+    this.zeroizeBuffer(previousChainKey);
+    this.zeroizeBuffer(messageKey);
     session.sendCounter += 1;
     this.touchSession(session);
+    this.lastActivityAt = this.now();
 
     const baseMessage = {
       type: 'chat',
@@ -958,7 +1155,10 @@ class SecureClient {
       { paddingSizeBuckets: this.paddingSizeBuckets },
     );
 
+    const previousChainKey = session.chainKeySend;
     session.chainKeySend = deriveNextChainKey(session.chainKeySend);
+    this.zeroizeBuffer(previousChainKey);
+    this.zeroizeBuffer(messageKey);
     session.sendCounter += 1;
     this.touchSession(session);
 
@@ -1030,6 +1230,8 @@ class SecureClient {
 
     const newSharedSecret = deriveSharedSecret(session.selfDHKeyPair.privateKey, incomingDhPublicKey);
     const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    this.zeroizeBuffer(session.rootKey);
+    this.zeroizeBuffer(session.chainKeyReceive);
     session.rootKey = Buffer.from(next.rootKey);
     session.chainKeyReceive = Buffer.from(next.chainKey);
     session.receiveCounter = 0;
@@ -1047,16 +1249,28 @@ class SecureClient {
     }
 
     if (message.counter < session.receiveCounter) {
+      this.noteTimestamp(this.replayAttemptTimestamps);
+      this.recordSecurityEvent('excessive_replay_attempts', { counter: message.counter }, {
+        type: 'excessive_replay_attempts',
+      });
       throw new Error('Protocol violation: invalid counter (replay or outside receive window)');
     }
     if (message.counter > session.receiveCounter + this.receiveWindow) {
+      this.noteTimestamp(this.counterGapTimestamps);
+      this.recordSecurityEvent('abnormal_counter_gaps', { counter: message.counter }, {
+        type: 'abnormal_counter_gaps',
+      });
       throw new Error(`Protocol violation: counter outside receive window (${this.receiveWindow})`);
     }
 
     let chainKey = session.chainKeyReceive;
     for (let counter = session.receiveCounter; counter < message.counter; counter += 1) {
       const skippedKey = deriveMessageKey(chainKey);
-      chainKey = deriveNextChainKey(chainKey);
+      const nextChain = deriveNextChainKey(chainKey);
+      if (counter > session.receiveCounter) {
+        this.zeroizeBuffer(chainKey);
+      }
+      chainKey = nextChain;
       session.skippedMessageKeys.set(
         this.makeSkippedKeyId(session.currentReceiveDhKey, counter),
         skippedKey,
@@ -1065,24 +1279,77 @@ class SecureClient {
     }
 
     const messageKey = deriveMessageKey(chainKey);
+    const previousChainKey = session.chainKeyReceive;
     session.chainKeyReceive = deriveNextChainKey(chainKey);
+    if (previousChainKey !== chainKey) {
+      this.zeroizeBuffer(previousChainKey);
+    }
+    this.zeroizeBuffer(chainKey);
     session.receiveCounter = message.counter + 1;
     return messageKey;
   }
 
   decryptChat({ message, senderDevicePublicKey, senderIdentityPublicKey, routeSecret }) {
+    return this.decryptChatInternal({
+      message,
+      senderDevicePublicKey,
+      senderIdentityPublicKey,
+      routeSecret,
+    });
+  }
+
+  decryptChatInternal(
+    { message, senderDevicePublicKey, senderIdentityPublicKey, routeSecret },
+    { allowQuarantine = true, acknowledge = true } = {},
+  ) {
+    this.evaluateBurstAnomaly(this.now());
     const normalizedMessage = validateMessage(message);
     this.validateRequiredChatMessageFields(normalizedMessage);
 
+    if (this.securityState.getCurrentState().sessionHealth === SESSION_HEALTH.SUSPECT && allowQuarantine) {
+      this.enqueueQuarantine({
+        message: normalizedMessage,
+        senderDevicePublicKey,
+        senderIdentityPublicKey,
+        routeSecret,
+      });
+      return null;
+    }
+
     // --- Trust enforcement (BEFORE decryption) ----------------------------
     if (senderIdentityPublicKey) {
-      const trustResult = this.checkAndUpdateTrust(senderIdentityPublicKey, senderDevicePublicKey);
+      const trustResult = this.checkAndUpdateTrust(
+        senderIdentityPublicKey,
+        senderDevicePublicKey,
+        normalizedMessage.senderDeviceId,
+      );
       if (trustResult === 'BLOCKED') {
+        this.noteTimestamp(this.droppedMessageTimestamps);
+        if (this.droppedMessageTimestamps.length >= this.securityThresholds.invalidSignatureRate) {
+          this.recordSecurityEvent('high_dropped_message_rate', { count: this.droppedMessageTimestamps.length }, {
+            type: 'high_dropped_message_rate',
+          });
+        }
         return null;
       }
     }
 
+    const currentSecurityState = this.securityState.getCurrentState();
+    if (
+      currentSecurityState.identityIntegrity === IDENTITY_INTEGRITY.CHANGED
+      && currentSecurityState.trustLevel === TRUST_LEVEL.VERIFIED
+    ) {
+      throw new Error('Security alert: fail-closed due to identity change on VERIFIED contact');
+    }
+
     if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
+      const rate = this.noteTimestamp(this.invalidSignatureTimestamps);
+      this.recordSecurityEvent('invalid_signature', { senderDeviceId: normalizedMessage.senderDeviceId }, {
+        type: 'repeated_message_failures',
+      });
+      if (rate >= this.securityThresholds.invalidSignatureRate) {
+        this.enterSafeMode('invalid signature rate exceeded');
+      }
       throw new Error('Protocol violation: invalid message signature');
     }
 
@@ -1095,6 +1362,10 @@ class SecureClient {
 
     this.pruneSeenMessageIds(session.seenMessageIds);
     if (session.seenMessageIds.has(normalizedMessage.messageId)) {
+      const replayRate = this.noteTimestamp(this.replayAttemptTimestamps);
+      if (replayRate >= this.securityThresholds.invalidSignatureRate) {
+        this.securityState.updateState({ type: 'excessive_replay_attempts' });
+      }
       return null;
     }
     session.seenMessageIds.set(normalizedMessage.messageId, Date.now() + this.replayTtlMs);
@@ -1103,6 +1374,13 @@ class SecureClient {
 
     const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
     if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
+      const routeRate = this.noteTimestamp(this.routeTagMismatchTimestamps);
+      this.recordSecurityEvent('route_tag_mismatch', { senderDeviceId: normalizedMessage.senderDeviceId }, {
+        type: 'repeated_message_failures',
+      });
+      if (routeRate >= this.securityThresholds.routeTagMismatchSpike) {
+        this.enterSafeMode('routeTag mismatch spike');
+      }
       throw new Error('Protocol violation: routeTag mismatch');
     }
 
@@ -1111,10 +1389,17 @@ class SecureClient {
     this.persistSessions();
 
     const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
+    this.zeroizeBuffer(messageKey);
     if (payload?.isDummy) {
       return null;
     }
-    this.acknowledgeDelivery(normalizedMessage);
+    if (acknowledge) {
+      this.acknowledgeDelivery(normalizedMessage);
+    }
+    this.lastActivityAt = this.now();
+    if (this.securityState.getCurrentState().sessionHealth !== SESSION_HEALTH.HEALTHY) {
+      this.securityState.updateState({ type: 'state_stabilized' });
+    }
     return payload;
   }
 
@@ -1138,6 +1423,24 @@ class SecureClient {
 
   handleInboundMessage(params) {
     const normalized = validateMessage(params.message);
+    if (normalized.type === 'handshake') {
+      if (!this.isHandshakeValid(normalized)) {
+        this.handshakeMismatchCount += 1;
+        this.recordSecurityEvent('handshake_mismatch', { count: this.handshakeMismatchCount });
+        if (this.handshakeMismatchCount >= this.securityThresholds.handshakeMismatches) {
+          this.enterSafeMode('repeated handshake mismatches');
+        }
+      } else {
+        this.handshakeMismatchCount = 0;
+      }
+      return null;
+    }
+
+    const relayCount = this.noteTimestamp(this.inboundBurstTimestamps, this.now());
+    if (relayCount >= this.securityThresholds.relayFloodRate) {
+      this.enterSafeMode('relay flooding detected');
+    }
+
     if (normalized.type === 'ack') {
       this.receiveAck(normalized);
       return null;
@@ -1149,6 +1452,9 @@ class SecureClient {
   }
 
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
+    if (this.safeMode) {
+      return;
+    }
     const boundedWindow = Math.max(0, Math.min(window, this.maxPullWindow));
     const effectiveRouteSecrets = [...new Set([...routeSecrets, ...this.decoyRouteSecrets])];
     const routeTags = [];
@@ -1212,6 +1518,9 @@ class SecureClient {
   }
 
   startAutoPull(routeSecrets = [], { intervalMs = 2_000, window = this.receiveWindow } = {}) {
+    if (this.safeMode) {
+      return;
+    }
     this.ensureDecoySessions();
     this.autoPullActive = true;
     this.autoPullRouteSecrets = [...routeSecrets];
@@ -1254,10 +1563,11 @@ class SecureClient {
    *
    * @param {string} identityPublicKey  PEM
    * @param {string} [devicePublicKey]  PEM (optional – for device tracking)
+   * @param {string} [peerDeviceId]
    * @throws if the identity is BLOCKED or a VERIFIED identity has changed key
    * @returns {'BLOCKED'|null} 'BLOCKED' when the message must be silently dropped
    */
-  checkAndUpdateTrust(identityPublicKey, devicePublicKey) {
+  checkAndUpdateTrust(identityPublicKey, devicePublicKey, peerDeviceId) {
     if (!this.trustStore || !identityPublicKey) {
       return null;
     }
@@ -1279,6 +1589,11 @@ class SecureClient {
           : [],
       };
       this.trustStore.set(fingerprint, entry);
+      this.securityState.updateState({
+        type: 'trust_downgrade',
+        to: TRUST_LEVEL.UNKNOWN,
+        identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
+      });
       return null;
     }
 
@@ -1288,6 +1603,10 @@ class SecureClient {
     // Check for identity key change (potential MITM): direct PEM comparison
     if (existing.identityPublicKey !== identityPublicKey) {
       updated.lastFingerprintChange = now;
+      this.recordSecurityEvent('identity_change_detected', { peerDeviceId }, {
+        type: 'identity_key_change_detected',
+        trustLevel: existing.level || TRUST_LEVEL.UNKNOWN,
+      });
 
       if (existing.level === TRUST_LEVELS.VERIFIED) {
         // Hard block – VERIFIED identity cannot silently change key
@@ -1306,6 +1625,10 @@ class SecureClient {
     // Enforce BLOCKED rule – return sentinel so caller can drop silently
     if (updated.level === TRUST_LEVELS.BLOCKED) {
       this.trustStore.set(fingerprint, updated);
+      this.recordSecurityEvent('blocked_message', { peerDeviceId }, {
+        type: 'trust_blocked',
+        trustLevel: TRUST_LEVEL.BLOCKED,
+      });
       return 'BLOCKED';
     }
 
@@ -1321,6 +1644,13 @@ class SecureClient {
     }
 
     this.trustStore.set(fingerprint, updated);
+    this.securityState.updateState({
+      type: 'trust_state_observed',
+      trustLevel: TRUST_LEVEL[updated.level] || TRUST_LEVEL.UNKNOWN,
+      identityIntegrity: updated.level === TRUST_LEVELS.VERIFIED
+        ? IDENTITY_INTEGRITY.OK
+        : this.securityState.getCurrentState().identityIntegrity,
+    });
     return null;
   }
 
@@ -1357,6 +1687,11 @@ class SecureClient {
       lastSeen: now,
       label: label !== undefined ? label : (existing.label || undefined),
     });
+    this.recordSecurityEvent('trust_changed', { level: TRUST_LEVELS.TRUSTED }, {
+      type: 'trust_state_observed',
+      trustLevel: TRUST_LEVEL.TRUSTED,
+      identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
+    });
   }
 
   /**
@@ -1382,6 +1717,11 @@ class SecureClient {
       lastSeen: now,
       verifiedAt: now,
     });
+    this.recordSecurityEvent('trust_changed', { level: TRUST_LEVELS.VERIFIED }, {
+      type: 'identity_verified',
+      trustLevel: TRUST_LEVEL.VERIFIED,
+      identityIntegrity: IDENTITY_INTEGRITY.OK,
+    });
   }
 
   /**
@@ -1406,6 +1746,10 @@ class SecureClient {
       level: TRUST_LEVELS.BLOCKED,
       lastSeen: now,
     });
+    this.recordSecurityEvent('trust_changed', { level: TRUST_LEVELS.BLOCKED }, {
+      type: 'trust_blocked',
+      trustLevel: TRUST_LEVEL.BLOCKED,
+    });
   }
 
   /**
@@ -1424,6 +1768,12 @@ class SecureClient {
       ...existing,
       level: TRUST_LEVELS.UNKNOWN,
       lastSeen: Date.now(),
+    });
+    this.recordSecurityEvent('trust_changed', { level: TRUST_LEVELS.UNKNOWN }, {
+      type: 'trust_downgrade',
+      to: TRUST_LEVEL.UNKNOWN,
+      trustLevel: TRUST_LEVEL.UNKNOWN,
+      identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
     });
   }
 
@@ -1481,6 +1831,31 @@ class SecureClient {
     );
   }
 
+  getSecuritySummary() {
+    const state = this.securityState.getCurrentState();
+    const warnings = [];
+    if (this.safeMode) {
+      warnings.push('SAFE MODE active: real message sending is disabled until manual resume.');
+    }
+    if (state.identityIntegrity === IDENTITY_INTEGRITY.CHANGED) {
+      warnings.push('Peer identity change detected.');
+    }
+    if (state.sessionHealth === SESSION_HEALTH.SUSPECT) {
+      warnings.push('Session health is suspect. Incoming messages may be quarantined.');
+    }
+    if (state.environmentRisk === ENVIRONMENT_RISK.HIGH) {
+      warnings.push('High risk network behavior detected.');
+    }
+    if (state.trustLevel === TRUST_LEVEL.BLOCKED) {
+      warnings.push('Current peer trust is blocked.');
+    }
+    return {
+      trustLevel: state.trustLevel,
+      fingerprintStatus: state.identityIntegrity,
+      warnings,
+    };
+  }
+
   close() {
     if (this.outboundFlushTimer) {
       clearTimeout(this.outboundFlushTimer);
@@ -1489,6 +1864,10 @@ class SecureClient {
     this.stopCoverTraffic();
     this.stopAutoPull();
     this.stopAckRetryLoop();
+    if (this.securityStateUnsubscribe) {
+      this.securityStateUnsubscribe();
+      this.securityStateUnsubscribe = null;
+    }
     this.persistSessions();
     if (this.socket) {
       this.socket.close();
