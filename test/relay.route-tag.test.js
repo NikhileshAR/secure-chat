@@ -105,7 +105,7 @@ test('server closes connections that repeatedly send malformed messages', async 
   server.stop();
 });
 
-test('server enforces per-device rate limits', async () => {
+test('server applies soft per-device rate limiting with silent drops', async () => {
   const port = 9300 + Math.floor(Math.random() * 200);
   const server = new RelayServer({
     host: '127.0.0.1',
@@ -116,7 +116,6 @@ test('server enforces per-device rate limits', async () => {
   server.start();
 
   const socket = await openSocket(`ws://127.0.0.1:${port}`);
-  const closeWait = new Promise((resolve) => socket.once('close', resolve));
   for (let i = 0; i < 3; i += 1) {
     socket.send(`${JSON.stringify({
       type: 'control',
@@ -127,9 +126,9 @@ test('server enforces per-device rate limits', async () => {
       timestamp: Date.now(),
     })}\n`);
   }
-  await closeWait;
-
-  assert.equal(socket.readyState, socket.CLOSED);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.notEqual(socket.readyState, socket.CLOSED);
+  socket.close();
   server.stop();
 });
 

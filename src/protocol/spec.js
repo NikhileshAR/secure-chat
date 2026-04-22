@@ -95,6 +95,13 @@ const ProtocolSpec = {
         'deviceKeySignature',
         'publicKeys',
         'supportedVersions',
+        'inviteToken',
+        'networkId',
+        'networkPublicKey',
+        'networkMetadata',
+        'networkMetadataSignature',
+        'accessMode',
+        'ephemeralMode',
       ],
       fieldTypes: {
         type: 'string',
@@ -107,10 +114,20 @@ const ProtocolSpec = {
         deviceKeySignature: 'string',
         publicKeys: 'object',
         supportedVersions: 'array:string',
+        inviteToken: 'string',
+        networkId: 'string',
+        networkPublicKey: 'string',
+        networkMetadata: 'object',
+        networkMetadataSignature: 'string',
+        accessMode: 'string',
+        ephemeralMode: 'boolean',
       },
       maxLengths: {
         senderDeviceId: 512,
         supportedVersions: 16,
+        inviteToken: 16384,
+        networkId: 128,
+        accessMode: 64,
       },
       normalize: (message) => normalizeHandshake(baseNormalize(message)),
     },
@@ -279,6 +296,9 @@ function validateType(name, value, expectedType) {
   }
   if (expectedType === 'integer' && (!Number.isInteger(value) || !Number.isFinite(value))) {
     throw new Error(`Protocol violation: field ${name} must be an integer`);
+  }
+  if (expectedType === 'boolean' && typeof value !== 'boolean') {
+    throw new Error(`Protocol violation: field ${name} must be a boolean`);
   }
   if (expectedType === 'object' && !isPlainObject(value)) {
     throw new Error(`Protocol violation: field ${name} must be an object`);

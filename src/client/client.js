@@ -5,6 +5,9 @@ const {
   randomInt,
   generateKeyPairSync,
   createHash,
+  createCipheriv,
+  createDecipheriv,
+  createHmac,
 } = require('node:crypto');
 const {
   generateIdentity,
@@ -34,8 +37,10 @@ const { encodeMessage, decodeMessage } = require('../protocol/wire');
 const { assertInvariant } = require('../protocol/invariants');
 const { SUPPORTED_VERSIONS, negotiateProtocolVersion } = require('../protocol/spec');
 const { SessionStore } = require('./storage/sessionStore');
-const { KeyVault } = require('./storage/keyVault');
+const { KeyVault, deriveKey, deriveKeyFromStoredKdf } = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
+const { NetworkTrustStore } = require('./networkTrustStore');
+const { RelayRegistry } = require('./relayRegistry');
 const {
   SecurityStateEngine,
   SECURITY_EVENTS,
@@ -156,6 +161,15 @@ class SecureClient {
     deviceSecret,
     trustStore,
     trustStoreStorageDir,
+    networkTrustStore,
+    networkTrustStoreStorageDir,
+    relayRegistry,
+    relayRegistryStorageDir,
+    networkBundle,
+    opsecMode,
+    keyVaultAutoLockMs = 30_000,
+    maxActiveSessions,
+    metadataRandomization,
     ackRetryIntervalMs = 2_000,
     ackMaxRetries = 5,
     longInactivityMs = DEFAULT_LONG_INACTIVITY_MS,
@@ -214,6 +228,24 @@ class SecureClient {
     this.knownPeerIdentities = new Map();
     this.securityProfile = safeConfig.securityProfile;
     this.productionMode = safeConfig.productionMode;
+    this.hardenedMode = String(opsecMode || '').toUpperCase() === 'HARDENED'
+      || this.securityProfile === 'MAX';
+    this.keyVaultAutoLockMs = Math.max(1_000, Number(keyVaultAutoLockMs) || 30_000);
+    this.maxActiveSessions = this.hardenedMode
+      ? Math.max(8, Number(maxActiveSessions) || 256)
+      : (Number.isFinite(Number(maxActiveSessions)) ? Math.max(8, Number(maxActiveSessions)) : Infinity);
+    this.metadataRandomization = metadataRandomization !== undefined
+      ? Boolean(metadataRandomization)
+      : this.hardenedMode;
+    this.networkBundle = networkBundle && typeof networkBundle === 'object'
+      ? {
+        relayUrl: networkBundle.relayUrl,
+        networkId: networkBundle.networkId,
+        networkPublicKey: networkBundle.networkPublicKey,
+        accessMode: networkBundle.accessMode,
+      }
+      : null;
+    this.pendingInviteToken = null;
     this.paddingSizeBuckets = normalizePaddingBuckets(effectivePaddingSizeBuckets);
     this.coverTrafficIntervalRangeMs = normalizeRange(
       coverTrafficIntervalRangeMs,
@@ -339,6 +371,14 @@ class SecureClient {
         deviceSecret,
       })
       : null);
+    this.networkTrustStore = networkTrustStore || ((networkTrustStoreStorageDir || sessionStorageDir) && deviceSecret
+      ? new NetworkTrustStore({
+        storageDir: networkTrustStoreStorageDir || sessionStorageDir,
+      })
+      : null);
+    this.relayRegistry = relayRegistry || (relayRegistryStorageDir
+      ? new RelayRegistry({ storageDir: relayRegistryStorageDir })
+      : null);
 
     if (this.sessionStore) {
       this.loadPersistedSessions();
@@ -359,6 +399,7 @@ class SecureClient {
       const loaded = this.sessionStore.loadSessions();
       if (loaded instanceof Map) {
         this.sessions = loaded;
+        this.enforceMaxActiveSessions();
         const now = Date.now();
         for (const session of this.sessions.values()) {
           if (session && typeof session === 'object') {
@@ -384,6 +425,18 @@ class SecureClient {
       return;
     }
     this.sessionStore.saveSessions(this.sessions);
+  }
+
+  enforceMaxActiveSessions() {
+    if (!Number.isFinite(this.maxActiveSessions) || this.sessions.size <= this.maxActiveSessions) {
+      return;
+    }
+    const ordered = [...this.sessions.entries()]
+      .sort((a, b) => (a[1]?.lastActivityAt || 0) - (b[1]?.lastActivityAt || 0));
+    while (ordered.length && this.sessions.size > this.maxActiveSessions) {
+      const [sessionId] = ordered.shift();
+      this.sessions.delete(sessionId);
+    }
   }
 
   appendSecurityEvent(type, details = {}) {
@@ -705,6 +758,13 @@ class SecureClient {
         privateKey: unlocked.devicePrivateKey,
       },
     };
+    if (this.hardenedMode) {
+      setTimeout(() => {
+        if (this.keyVault) {
+          this.keyVault.clearUnlockedKeys();
+        }
+      }, this.keyVaultAutoLockMs);
+    }
     return unlocked;
   }
 
@@ -773,7 +833,19 @@ class SecureClient {
       this.socket.once('error', reject);
     });
 
-    this.sendRaw({
+    const relayHandshake = await this.waitForRelayHandshake();
+    if (!this.verifyRelayHandshake(relayHandshake)) {
+      this.socket.close();
+      throw new Error('Relay network identity verification failed');
+    }
+    if (this.relayRegistry) {
+      this.relayRegistry.upsert({
+        url: this.serverUrl,
+        trustLevel: 'TRUSTED',
+      });
+    }
+
+    const handshake = {
       type: 'handshake',
       protocolVersion: this.protocolVersion,
       senderDeviceId: this.identity.deviceId,
@@ -788,7 +860,12 @@ class SecureClient {
         postQuantumDevice: this.postQuantumPublicKey,
       },
       supportedVersions: this.supportedVersions,
-    });
+    };
+    if (this.pendingInviteToken) {
+      handshake.inviteToken = this.pendingInviteToken;
+    }
+    this.sendRaw(handshake);
+    this.pendingInviteToken = null;
     for (const session of this.sessions.values()) {
       if (session && typeof session === 'object') {
         session.ratchetPending = true;
@@ -797,6 +874,94 @@ class SecureClient {
     }
     this.startAckRetryLoop();
     this.startCoverTraffic();
+  }
+
+  async waitForRelayHandshake(timeoutMs = 2_500) {
+    if (!this.socket) {
+      throw new Error('Client is not connected');
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error('Relay handshake timeout'));
+      }, timeoutMs);
+      this.socket.once('message', (payload) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        try {
+          resolve(decodeMessage(payload, { strictMode: this.strictWireMode }));
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.socket.once('error', (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  verifyRelayHandshake(handshake) {
+    if (!handshake || handshake.type !== 'handshake') {
+      return false;
+    }
+    if (handshake.senderDeviceId !== 'relay') {
+      return false;
+    }
+    const result = this.networkTrustStore
+      ? this.networkTrustStore.verifyAndTrust({
+        networkId: handshake.networkId,
+        networkPublicKey: handshake.networkPublicKey,
+        networkMetadata: handshake.networkMetadata,
+        networkMetadataSignature: handshake.networkMetadataSignature,
+        bundle: this.networkBundle,
+      })
+      : { ok: true };
+    if (!result.ok) {
+      this.appendSecurityEvent('relay_network_verification_failed', { reason: result.reason });
+      return false;
+    }
+    if (
+      this.networkBundle?.relayUrl
+      && String(this.networkBundle.relayUrl) !== String(this.serverUrl)
+    ) {
+      this.appendSecurityEvent('relay_network_verification_failed', {
+        reason: 'bundle_relay_url_mismatch',
+      });
+      return false;
+    }
+    if (
+      this.networkBundle?.accessMode
+      && String(this.networkBundle.accessMode) !== String(handshake.accessMode)
+    ) {
+      this.appendSecurityEvent('relay_network_verification_failed', {
+        reason: 'bundle_access_mode_mismatch',
+      });
+      return false;
+    }
+    return true;
+  }
+
+  async connectWithInvite(relayUrl, inviteToken) {
+    if (relayUrl) {
+      this.serverUrl = relayUrl;
+    }
+    this.pendingInviteToken = String(inviteToken || '');
+    if (!this.pendingInviteToken) {
+      throw new Error('inviteToken is required');
+    }
+    await this.connect();
   }
 
   sendRaw(message) {
@@ -1008,6 +1173,7 @@ class SecureClient {
     };
 
     this.sessions.set(sessionId, session);
+    this.enforceMaxActiveSessions();
     this.persistSessions();
     return session;
   }
@@ -1062,6 +1228,9 @@ class SecureClient {
   }
 
   isHandshakeValid(handshakeMessage) {
+    if (handshakeMessage?.senderDeviceId === 'relay') {
+      return this.verifyRelayHandshake(handshakeMessage);
+    }
     const remoteSupportedVersions = handshakeMessage.supportedVersions
       || (handshakeMessage.protocolVersion
         ? [handshakeMessage.protocolVersion]
@@ -1201,7 +1370,8 @@ class SecureClient {
       previousCounter,
       dhPublicKey,
       encryptedPayload: JSON.stringify(encrypted),
-      timestamp: Date.now(),
+      timestamp: Date.now()
+        + (this.metadataRandomization ? randomInt(-250, 251) : 0),
     };
 
     const signature = signMessage(this.identity.identityKeyPair.privateKey, baseMessage);
@@ -1731,6 +1901,9 @@ class SecureClient {
       this.receiveAck(normalized);
       return null;
     }
+    if (normalized.type === 'handshake') {
+      return this.isHandshakeValid(normalized);
+    }
     if (normalized.type === 'chat') {
       return this.decryptChat({ ...params, message: normalized });
     }
@@ -2167,6 +2340,9 @@ class SecureClient {
   }
 
   setStrictWireMode(enabled, confirmation = {}) {
+    if (this.hardenedMode && !enabled) {
+      throw new Error('HARDENED mode does not allow disabling strictWireMode');
+    }
     if (!enabled) {
       this.confirmSensitiveAction({
         action: 'disableStrictWireMode',
@@ -2180,6 +2356,9 @@ class SecureClient {
   }
 
   exportSecurityLog(filePath, passphrase, confirmation = {}) {
+    if (this.hardenedMode && confirmation.secondConfirmed !== true) {
+      throw new Error('HARDENED mode requires double confirmation for exportSecurityLog');
+    }
     this.confirmSensitiveAction({
       action: 'exportSecurityLog',
       fingerprint: this.getConfigFingerprint(),
@@ -2190,6 +2369,9 @@ class SecureClient {
   }
 
   exportPrivateKeys(passphrase, confirmation = {}) {
+    if (this.hardenedMode) {
+      throw new Error('HARDENED mode blocks private key export');
+    }
     this.confirmSensitiveAction({
       action: 'exportPrivateKeys',
       fingerprint: this.getConfigFingerprint(),
@@ -2215,6 +2397,113 @@ class SecureClient {
     return createHash('sha256')
       .update(stableStringify(configSnapshot))
       .digest('hex');
+  }
+
+  serializeBackupSessions() {
+    if (!this.sessionStore) {
+      return [];
+    }
+    return [...this.sessions.entries()]
+      .map(([sessionId, session]) => this.sessionStore.serializeSession(sessionId, session));
+  }
+
+  restoreBackupSessions(records = []) {
+    if (!this.sessionStore || !Array.isArray(records)) {
+      return;
+    }
+    const restored = new Map();
+    for (const record of records) {
+      if (!record?.sessionId) {
+        continue;
+      }
+      restored.set(record.sessionId, this.sessionStore.deserializeSession(record));
+    }
+    this.sessions = restored;
+    this.enforceMaxActiveSessions();
+    this.persistSessions();
+  }
+
+  exportBackup(passphrase) {
+    if (!passphrase) {
+      throw new Error('exportBackup requires passphrase');
+    }
+    const backupDoc = {
+      schemaVersion: 1,
+      createdAt: Date.now(),
+      identity: this.identity,
+      knownPeerIdentities: [...this.knownPeerIdentities.entries()],
+      sessions: this.serializeBackupSessions(),
+      trustEntries: this.trustStore ? this.trustStore.list() : [],
+    };
+    const salt = randomBytes(16);
+    const { key, kdf } = deriveKey(passphrase, salt);
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', key, iv);
+    const ciphertext = Buffer.concat([
+      cipher.update(Buffer.from(stableStringify(backupDoc), 'utf8')),
+      cipher.final(),
+    ]);
+    const tag = cipher.getAuthTag();
+    const mac = createHmac('sha256', key)
+      .update(iv)
+      .update(tag)
+      .update(ciphertext)
+      .digest('base64');
+    return {
+      schemaVersion: 1,
+      kdf,
+      iv: iv.toString('base64'),
+      tag: tag.toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+      mac,
+    };
+  }
+
+  importBackup(blob, passphrase) {
+    if (!blob || !passphrase) {
+      throw new Error('importBackup requires blob and passphrase');
+    }
+    if (blob.schemaVersion !== 1) {
+      throw new Error('Backup schema mismatch');
+    }
+    const key = deriveKeyFromStoredKdf(passphrase, blob.kdf || {});
+    const iv = Buffer.from(blob.iv || '', 'base64');
+    const tag = Buffer.from(blob.tag || '', 'base64');
+    const ciphertext = Buffer.from(blob.ciphertext || '', 'base64');
+    const expectedMac = createHmac('sha256', key)
+      .update(iv)
+      .update(tag)
+      .update(ciphertext)
+      .digest('base64');
+    if (expectedMac !== blob.mac) {
+      throw new Error('Backup authentication failed');
+    }
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    let parsed;
+    try {
+      parsed = JSON.parse(plaintext.toString('utf8'));
+    } catch {
+      throw new Error('Backup payload is invalid');
+    }
+    if (parsed.schemaVersion !== 1 || !parsed.identity) {
+      throw new Error('Backup schema mismatch');
+    }
+    this.identity = parsed.identity;
+    this.knownPeerIdentities = new Map(parsed.knownPeerIdentities || []);
+    this.restoreBackupSessions(parsed.sessions || []);
+    if (this.trustStore) {
+      const entries = new Map();
+      for (const entry of parsed.trustEntries || []) {
+        if (entry?.fingerprint) {
+          entries.set(entry.fingerprint, entry);
+        }
+      }
+      this.trustStore.saveTrust(entries);
+      this.trustStore.loadTrust();
+    }
+    return true;
   }
 
   close() {

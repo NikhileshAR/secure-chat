@@ -12,6 +12,9 @@ Privacy-first self-hosted communication baseline implementation.
 - Strict protocol schema + versioning validation (`src/protocol/schema.js`)
 - Encrypted session persistence and key vault storage (`src/client/storage/*`)
 - Multi-device registry linking and ACK-aware delivery retries
+- Relay network identity + signed metadata + invite-only mode
+- Client network TOFU trust store and local relay registry
+- Deploy setup and client bundle generation (`deploy/setup.js`, `deploy/generateClientBundle.js`)
 
 ## Run relay server
 
@@ -30,4 +33,11 @@ Config via env vars:
 
 ```bash
 npm test
+```
+
+## Deployment helpers
+
+```bash
+node deploy/setup.js
+node deploy/generateClientBundle.js
 ```

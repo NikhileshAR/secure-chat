@@ -1,10 +1,14 @@
 const { WebSocketServer } = require('ws');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes, randomInt } = require('node:crypto');
+const path = require('node:path');
+const os = require('node:os');
 const {
   normalizeControlMessage,
   ensureProtocolVersion,
   PROTOCOL_VERSION,
 } = require('../protocol/schema');
+const { NetworkIdentityManager } = require('./networkIdentity');
+const { InviteManager } = require('./inviteManager');
 
 class RelayServer {
   constructor({
@@ -23,6 +27,12 @@ class RelayServer {
     maxConcurrentConnections = 1_000,
     maxBufferedBytes = 512 * 1024,
     maxPullRouteTags = 2_048,
+    accessMode = 'OPEN',
+    ephemeralMode = true,
+    trafficJitterMs = { min: 0, max: 25 },
+    networkIdentityStorageDir = path.join(os.homedir(), '.secure-chat-relay'),
+    networkIdentityFilename,
+    inviteUsageFilename,
   } = {}) {
     this.host = host;
     this.port = port;
@@ -39,14 +49,34 @@ class RelayServer {
     this.maxConcurrentConnections = Math.max(1, Number(maxConcurrentConnections) || 1_000);
     this.maxBufferedBytes = Math.max(32 * 1024, Number(maxBufferedBytes) || 512 * 1024);
     this.maxPullRouteTags = Math.max(1, Number(maxPullRouteTags) || 2_048);
+    this.accessMode = accessMode === 'INVITE_ONLY' ? 'INVITE_ONLY' : 'OPEN';
+    this.ephemeralMode = ephemeralMode !== false;
+    this.trafficJitterMs = {
+      min: Math.max(0, Number(trafficJitterMs?.min) || 0),
+      max: Math.max(0, Number(trafficJitterMs?.max) || 0),
+    };
+    if (this.trafficJitterMs.max < this.trafficJitterMs.min) {
+      this.trafficJitterMs.max = this.trafficJitterMs.min;
+    }
 
     this.connections = new Map();
+    this.connectionIds = new WeakMap();
     this.routeStore = new Map();
     this.invalidMessageCounts = new WeakMap();
     this.recentPayloadFingerprints = new Map();
     this.deviceMessageRates = new Map();
     this.routeTagMessageRates = new Map();
     this.connectionMessageRates = new WeakMap();
+    this.locked = false;
+    this.networkIdentity = new NetworkIdentityManager({
+      storageDir: networkIdentityStorageDir,
+      filename: networkIdentityFilename,
+    });
+    this.inviteManager = new InviteManager({
+      networkIdentity: this.networkIdentity,
+      storageDir: networkIdentityStorageDir,
+      usageFilename: inviteUsageFilename,
+    });
     this.wss = null;
   }
 
@@ -61,6 +91,8 @@ class RelayServer {
         socket.close();
         return;
       }
+      this.connectionIds.set(socket, randomBytes(16).toString('hex'));
+      this.sendRelayHandshake(socket);
       socket.on('message', (data) => this.handleMessage(socket, data.toString()));
       socket.on('close', () => this.cleanupSocket(socket));
     });
@@ -77,6 +109,7 @@ class RelayServer {
     this.recentPayloadFingerprints.clear();
     this.deviceMessageRates.clear();
     this.routeTagMessageRates.clear();
+    this.connectionIds = new WeakMap();
   }
 
   cleanupSocket(socket) {
@@ -86,6 +119,57 @@ class RelayServer {
       }
     }
     this.connectionMessageRates.delete(socket);
+    this.connectionIds.delete(socket);
+  }
+
+  lockNetwork() {
+    this.locked = true;
+  }
+
+  unlockNetwork() {
+    this.locked = false;
+  }
+
+  buildSignedNetworkMetadata() {
+    const identity = this.networkIdentity.getNetworkIdentity();
+    const metadata = {
+      networkId: identity.networkId,
+      networkPublicKey: identity.networkPublicKey,
+      accessMode: this.accessMode,
+      ephemeralMode: this.ephemeralMode,
+      issuedAt: Date.now(),
+    };
+    const signature = this.networkIdentity.signNetworkMetadata(metadata);
+    return {
+      ...identity,
+      metadata,
+      signature,
+    };
+  }
+
+  sendRelayHandshake(socket) {
+    if (!socket || socket.readyState !== socket.OPEN) {
+      return;
+    }
+    const {
+      networkId,
+      networkPublicKey,
+      metadata,
+      signature,
+    } = this.buildSignedNetworkMetadata();
+    socket.send(`${JSON.stringify({
+      type: 'handshake',
+      protocolVersion: PROTOCOL_VERSION,
+      senderDeviceId: 'relay',
+      encryptedPayload: '',
+      timestamp: Date.now(),
+      networkId,
+      networkPublicKey,
+      networkMetadata: metadata,
+      networkMetadataSignature: signature,
+      accessMode: this.accessMode,
+      ephemeralMode: this.ephemeralMode,
+    })}\n`);
   }
 
   checkRateLimit(store, key, { maxMessages, windowMs }, now = Date.now()) {
@@ -126,8 +210,7 @@ class RelayServer {
       }
 
       if (!this.checkConnectionRateLimit(socket)) {
-        socket.close();
-        return;
+        continue;
       }
 
       let message;
@@ -152,12 +235,28 @@ class RelayServer {
           this.perDeviceRateLimit,
         );
         if (!ok) {
-          socket.close();
-          return;
+          continue;
         }
       }
 
       if (message.type === 'handshake') {
+        if (
+          this.locked
+          && typeof message.senderDeviceId === 'string'
+          && !this.connections.has(message.senderDeviceId)
+        ) {
+          continue;
+        }
+        if (this.accessMode === 'INVITE_ONLY') {
+          const token = message.inviteToken;
+          if (typeof token !== 'string' || !token.length) {
+            continue;
+          }
+          const tokenCheck = this.inviteManager.verifyToken(token, { consume: true });
+          if (!tokenCheck.valid) {
+            continue;
+          }
+        }
         this.connections.set(message.senderDeviceId, socket);
         continue;
       }
@@ -256,7 +355,7 @@ class RelayServer {
       }
       const start = batchIndex * this.relayBatchSize;
       const batchMessages = matches.slice(start, start + this.relayBatchSize);
-      socket.send(`${JSON.stringify({
+      const payload = `${JSON.stringify({
         type: 'control',
         action: 'deliver',
         protocolVersion: PROTOCOL_VERSION,
@@ -268,7 +367,19 @@ class RelayServer {
         }),
         senderDeviceId: 'relay',
         timestamp: Date.now(),
-      })}\n`);
+      })}\n`;
+      const jitter = this.trafficJitterMs.max > 0
+        ? randomInt(this.trafficJitterMs.min, this.trafficJitterMs.max + 1)
+        : 0;
+      if (jitter > 0) {
+        setTimeout(() => {
+          if (socket.readyState === socket.OPEN) {
+            socket.send(payload);
+          }
+        }, jitter);
+      } else {
+        socket.send(payload);
+      }
     }
   }
 
@@ -344,8 +455,16 @@ if (require.main === module) {
   const host = process.env.SECURE_RELAY_HOST || process.env.SEKURE_RELAY_HOST || '0.0.0.0';
   const port = Number(process.env.SECURE_RELAY_PORT || process.env.SEKURE_RELAY_PORT || 8080);
   const ttl = Number(process.env.SECURE_RELAY_TTL_MS || process.env.SEKURE_RELAY_TTL_MS || 60_000);
+  const accessMode = process.env.SECURE_RELAY_ACCESS_MODE === 'INVITE_ONLY' ? 'INVITE_ONLY' : 'OPEN';
+  const identityDir = process.env.SECURE_RELAY_IDENTITY_DIR;
 
-  const server = new RelayServer({ host, port, messageTtlMs: ttl });
+  const server = new RelayServer({
+    host,
+    port,
+    messageTtlMs: ttl,
+    accessMode,
+    ...(identityDir ? { networkIdentityStorageDir: identityDir } : {}),
+  });
   server.start();
 }
 

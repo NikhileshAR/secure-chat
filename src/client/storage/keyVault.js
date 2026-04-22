@@ -171,4 +171,6 @@ class KeyVault {
 module.exports = {
   KeyVault,
   KEY_VAULT_SCHEMA_VERSION,
+  deriveKey,
+  deriveKeyFromStoredKdf,
 };
