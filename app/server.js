@@ -261,7 +261,6 @@ class InstanceManager {
       }
     }
 
-    this.schedulePollLoop(ctx);
     return ctx.client;
   }
 
@@ -446,6 +445,7 @@ class InstanceManager {
         ctx.state.activeRelayUrl = relayUrl;
         ctx.state.activeRelayIndex = relayIndex;
         this.attachSocketListeners(ctx);
+        this.schedulePollLoop(ctx);
         return relayUrl;
       } catch (error) {
         lastError = error;

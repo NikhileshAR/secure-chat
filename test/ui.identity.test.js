@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { randomBytes } = require('node:crypto');
 
 const { InstanceManager } = require('../app/server');
 const appHelpers = require('../app/public/app');
@@ -21,29 +22,35 @@ function closeAndCleanupContext(context) {
   fs.rmSync(context.paths.baseDir, { recursive: true, force: true });
 }
 
-test('new identity is created per client instance', () => {
+function createTestInstanceId(prefix) {
+  return `${prefix}-${randomBytes(6).toString('hex')}`;
+}
+
+test('new identity is created per client instance', (t) => {
   const manager = new InstanceManager();
-  const contextA = manager.getContext(`ui-test-a-${Date.now()}-${Math.random()}`);
-  const contextB = manager.getContext(`ui-test-b-${Date.now()}-${Math.random()}`);
+  const contextA = manager.getContext(createTestInstanceId('ui-test-a'));
+  const contextB = manager.getContext(createTestInstanceId('ui-test-b'));
+  t.after(() => {
+    closeAndCleanupContext(contextA);
+    closeAndCleanupContext(contextB);
+  });
 
   const stateA = manager.serializeState(contextA);
   const stateB = manager.serializeState(contextB);
   assert.notEqual(stateA.identity.fingerprint, stateB.identity.fingerprint);
-
-  closeAndCleanupContext(contextA);
-  closeAndCleanupContext(contextB);
 });
 
-test('reset identity generates a new fingerprint', () => {
+test('reset identity generates a new fingerprint', (t) => {
   const manager = new InstanceManager();
-  const context = manager.getContext(`ui-test-reset-${Date.now()}-${Math.random()}`);
+  const context = manager.getContext(createTestInstanceId('ui-test-reset'));
+  t.after(() => {
+    closeAndCleanupContext(context);
+  });
 
   const before = manager.serializeState(context).identity.fingerprint;
   manager.resetIdentity(context);
   const after = manager.serializeState(context).identity.fingerprint;
   assert.notEqual(before, after);
-
-  closeAndCleanupContext(context);
 });
 
 test('message sender detection uses sender identity public key', () => {
@@ -55,10 +62,14 @@ test('message sender detection uses sender identity public key', () => {
   assert.equal(appHelpers.detectMessageRole(inbound, myIdentity), 'peer');
 });
 
-test('contact add flow auto-trusts and stores contact details', () => {
+test('contact add flow auto-trusts and stores contact details', (t) => {
   const manager = new InstanceManager();
-  const contextA = manager.getContext(`ui-test-contact-a-${Date.now()}-${Math.random()}`);
-  const contextB = manager.getContext(`ui-test-contact-b-${Date.now()}-${Math.random()}`);
+  const contextA = manager.getContext(createTestInstanceId('ui-test-contact-a'));
+  const contextB = manager.getContext(createTestInstanceId('ui-test-contact-b'));
+  t.after(() => {
+    closeAndCleanupContext(contextA);
+    closeAndCleanupContext(contextB);
+  });
 
   contextB.state.relays = ['ws://relay.example:8080'];
   const shared = manager.getIdentitySharePayload(contextB);
@@ -71,7 +82,4 @@ test('contact add flow auto-trusts and stores contact details', () => {
   const contacts = manager.listContactsWithTrust(contextA);
   assert.equal(contacts.length, 1);
   assert.equal(contacts[0].trustLevel, 'TRUSTED');
-
-  closeAndCleanupContext(contextA);
-  closeAndCleanupContext(contextB);
 });
