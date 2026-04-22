@@ -1,5 +1,5 @@
 const { WebSocketServer } = require('ws');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
 const {
   normalizeControlMessage,
   ensureProtocolVersion,
@@ -23,6 +23,11 @@ class RelayServer {
     maxConcurrentConnections = 1_000,
     maxBufferedBytes = 512 * 1024,
     maxPullRouteTags = 2_048,
+    ephemeralMode = true,
+    logLevel = 'minimal',
+    enableMetrics = false,
+    relayFlushBaseDelayMs = 4,
+    relayFlushJitterMs = 12,
   } = {}) {
     this.host = host;
     this.port = port;
@@ -39,6 +44,11 @@ class RelayServer {
     this.maxConcurrentConnections = Math.max(1, Number(maxConcurrentConnections) || 1_000);
     this.maxBufferedBytes = Math.max(32 * 1024, Number(maxBufferedBytes) || 512 * 1024);
     this.maxPullRouteTags = Math.max(1, Number(maxPullRouteTags) || 2_048);
+    this.ephemeralMode = ephemeralMode !== false;
+    this.logLevel = String(logLevel || 'minimal');
+    this.enableMetrics = Boolean(enableMetrics);
+    this.relayFlushBaseDelayMs = Math.max(0, Number(relayFlushBaseDelayMs) || 0);
+    this.relayFlushJitterMs = Math.max(0, Number(relayFlushJitterMs) || 0);
 
     this.connections = new Map();
     this.routeStore = new Map();
@@ -47,7 +57,17 @@ class RelayServer {
     this.deviceMessageRates = new Map();
     this.routeTagMessageRates = new Map();
     this.connectionMessageRates = new WeakMap();
+    this.connectionIds = new WeakMap();
+    this.pendingFlushTimers = new Set();
     this.wss = null;
+    this.relayId = randomBytes(16).toString('hex');
+    this.startedAtMs = 0;
+    this.metrics = {
+      acceptedConnections: 0,
+      relayedMessages: 0,
+      droppedBySoftRateLimit: 0,
+      droppedInvalidMessages: 0,
+    };
   }
 
   start() {
@@ -55,12 +75,15 @@ class RelayServer {
       return;
     }
 
+    this.startedAtMs = Date.now();
     this.wss = new WebSocketServer({ host: this.host, port: this.port });
     this.wss.on('connection', (socket) => {
       if (this.wss.clients.size > this.maxConcurrentConnections) {
         socket.close();
         return;
       }
+      this.connectionIds.set(socket, randomBytes(16).toString('hex'));
+      this.metrics.acceptedConnections += 1;
       socket.on('message', (data) => this.handleMessage(socket, data.toString()));
       socket.on('close', () => this.cleanupSocket(socket));
     });
@@ -72,6 +95,10 @@ class RelayServer {
     }
     this.wss.close();
     this.wss = null;
+    for (const timer of this.pendingFlushTimers) {
+      clearTimeout(timer);
+    }
+    this.pendingFlushTimers.clear();
     this.connections.clear();
     this.routeStore.clear();
     this.recentPayloadFingerprints.clear();
@@ -126,8 +153,8 @@ class RelayServer {
       }
 
       if (!this.checkConnectionRateLimit(socket)) {
-        socket.close();
-        return;
+        this.metrics.droppedBySoftRateLimit += 1;
+        continue;
       }
 
       let message;
@@ -138,6 +165,7 @@ class RelayServer {
       } catch {
         const invalidCount = (this.invalidMessageCounts.get(socket) || 0) + 1;
         this.invalidMessageCounts.set(socket, invalidCount);
+        this.metrics.droppedInvalidMessages += 1;
         if (invalidCount >= 5) {
           socket.close();
         }
@@ -250,25 +278,37 @@ class RelayServer {
 
     const totalBatches = Math.max(1, Math.ceil(matches.length / this.relayBatchSize));
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
-      if (socket.bufferedAmount > this.maxBufferedBytes) {
-        socket.close();
-        break;
-      }
       const start = batchIndex * this.relayBatchSize;
       const batchMessages = matches.slice(start, start + this.relayBatchSize);
-      socket.send(`${JSON.stringify({
-        type: 'control',
-        action: 'deliver',
-        protocolVersion: PROTOCOL_VERSION,
-        encryptedPayload: JSON.stringify({
-          messages: batchMessages,
-          batchIndex,
-          totalBatches,
-          more: batchIndex < totalBatches - 1,
-        }),
-        senderDeviceId: 'relay',
-        timestamp: Date.now(),
-      })}\n`);
+      const jitter = this.relayFlushJitterMs > 0
+        ? Math.floor(Math.random() * (this.relayFlushJitterMs * 2 + 1)) - this.relayFlushJitterMs
+        : 0;
+      const delayMs = Math.max(0, (batchIndex * this.relayFlushBaseDelayMs) + jitter);
+      const timer = setTimeout(() => {
+        this.pendingFlushTimers.delete(timer);
+        if (socket.readyState !== socket.OPEN) {
+          return;
+        }
+        if (socket.bufferedAmount > this.maxBufferedBytes) {
+          socket.close();
+          return;
+        }
+        socket.send(`${JSON.stringify({
+          type: 'control',
+          action: 'deliver',
+          protocolVersion: PROTOCOL_VERSION,
+          encryptedPayload: JSON.stringify({
+            messages: batchMessages,
+            batchIndex,
+            totalBatches,
+            more: batchIndex < totalBatches - 1,
+          }),
+          senderDeviceId: 'relay',
+          timestamp: Date.now(),
+        })}\n`);
+        this.metrics.relayedMessages += batchMessages.length;
+      }, delayMs);
+      this.pendingFlushTimers.add(timer);
     }
   }
 
@@ -337,6 +377,21 @@ class RelayServer {
         this.routeStore.delete(oldestRouteTag);
       }
     }
+  }
+
+  getMetrics() {
+    return {
+      relayId: this.relayId,
+      uptimeMs: this.startedAtMs ? Date.now() - this.startedAtMs : 0,
+      activeConnections: this.wss ? this.wss.clients.size : 0,
+      acceptedConnections: this.metrics.acceptedConnections,
+      relayedMessages: this.metrics.relayedMessages,
+      droppedBySoftRateLimit: this.metrics.droppedBySoftRateLimit,
+      droppedInvalidMessages: this.metrics.droppedInvalidMessages,
+      ephemeralMode: this.ephemeralMode,
+      logLevel: this.logLevel,
+      enableMetrics: this.enableMetrics,
+    };
   }
 }
 
