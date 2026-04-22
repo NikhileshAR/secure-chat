@@ -21,6 +21,34 @@ function asciiQr(seed) {
   return rows.join('\n');
 }
 
+function buildSetupConfig({
+  port = 8080,
+  maxConnections = 1000,
+  logLevel = 'minimal',
+  securityProfile = 'BALANCED',
+} = {}) {
+  const normalizedProfile = String(securityProfile || 'BALANCED').toUpperCase();
+  return {
+    host: '0.0.0.0',
+    port: Number(port),
+    maxConnections: Number(maxConnections),
+    maxBufferedBytes: 512 * 1024,
+    maxMessageSizeBytes: 64 * 1024,
+    rateLimits: {
+      connection: { windowMs: 1_000, maxMessages: normalizedProfile === 'MAX' ? 200 : 300 },
+      device: { windowMs: 1_000, maxMessages: normalizedProfile === 'MAX' ? 80 : 120 },
+      routeTag: { windowMs: 1_000, maxMessages: normalizedProfile === 'MAX' ? 150 : 200 },
+    },
+    relayBatchSize: 50,
+    shuffleDelivery: true,
+    logLevel,
+    enableMetrics: true,
+    ephemeralMode: true,
+    strictWireMode: true,
+    securityProfile: normalizedProfile,
+  };
+}
+
 async function promptConfig() {
   const rl = readline.createInterface({ input: stdin, output: stdout });
   const port = Number((await rl.question('Port (default 8080): ')).trim() || '8080');
@@ -29,25 +57,7 @@ async function promptConfig() {
   const securityProfile = ((await rl.question('Security profile (MAX|BALANCED, default BALANCED): ')).trim() || 'BALANCED').toUpperCase();
   await rl.close();
 
-  return {
-    host: '0.0.0.0',
-    port,
-    maxConnections,
-    maxBufferedBytes: 512 * 1024,
-    maxMessageSizeBytes: 64 * 1024,
-    rateLimits: {
-      connection: { windowMs: 1_000, maxMessages: securityProfile === 'MAX' ? 200 : 300 },
-      device: { windowMs: 1_000, maxMessages: securityProfile === 'MAX' ? 80 : 120 },
-      routeTag: { windowMs: 1_000, maxMessages: securityProfile === 'MAX' ? 150 : 200 },
-    },
-    relayBatchSize: 50,
-    shuffleDelivery: true,
-    logLevel,
-    enableMetrics: true,
-    ephemeralMode: true,
-    strictWireMode: true,
-    securityProfile,
-  };
+  return buildSetupConfig({ port, maxConnections, logLevel, securityProfile });
 }
 
 async function main() {
@@ -92,4 +102,5 @@ if (require.main === module) {
 
 module.exports = {
   promptConfig,
+  buildSetupConfig,
 };

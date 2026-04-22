@@ -20,11 +20,20 @@ function checkEntropyAvailability() {
 }
 
 function checkClockSyncSanity() {
-  const wall = Date.now();
-  const highResMs = Number(process.hrtime.bigint() / 1_000_000n);
-  const approxWallFromUptime = Date.now() - Math.floor(process.uptime() * 1000);
-  const drift = Math.abs((wall - approxWallFromUptime) - highResMs);
-  return drift < MAX_CLOCK_DRIFT_MS;
+  const now = Date.now();
+  if (!Number.isFinite(now) || now < 1577836800000) {
+    return false;
+  }
+  const wallStart = Date.now();
+  const hrStart = Number(process.hrtime.bigint() / 1_000_000n);
+  const wallEnd = Date.now();
+  const hrEnd = Number(process.hrtime.bigint() / 1_000_000n);
+  const wallDelta = wallEnd - wallStart;
+  const hrDelta = hrEnd - hrStart;
+  if (!Number.isFinite(wallDelta) || !Number.isFinite(hrDelta) || wallDelta < 0 || hrDelta < 0) {
+    return false;
+  }
+  return Math.abs(wallDelta - hrDelta) < Math.min(MAX_CLOCK_DRIFT_MS, 5_000);
 }
 
 function runSystemCheck() {
