@@ -1,11 +1,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { randomBytes } = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { SecureClient } = require('../src/client/client');
 const { generateIdentity, formatIdentityFingerprint } = require('../src/client/identity');
 
 function createDemoClient(identity) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'securechat-demo-flow-'));
   const client = new SecureClient({
     serverUrl: 'ws://127.0.0.1:1',
     identity,
@@ -16,6 +20,8 @@ function createDemoClient(identity) {
     coverTrafficIntervalRangeMs: { min: 60_000, max: 60_000 },
     rateShaping: { minMessagesPerSecond: 1_000_000, maxMessagesPerSecond: 1_000_000 },
     securityProfile: 'DEV',
+    trustStoreStorageDir: dir,
+    deviceSecret: 'demo-flow-secret',
   });
 
   const wire = [];
@@ -23,7 +29,7 @@ function createDemoClient(identity) {
     wire.push(message);
   };
 
-  return { client, wire };
+  return { client, wire, dir };
 }
 
 function buildIdentitySharePayload(identity, routeSecret) {
@@ -39,8 +45,8 @@ function buildIdentitySharePayload(identity, routeSecret) {
 test('demo flow: two clients exchange identity payloads and deliver messages', () => {
   const aliceIdentity = generateIdentity();
   const bobIdentity = generateIdentity();
-  const { client: alice, wire: aliceWire } = createDemoClient(aliceIdentity);
-  const { client: bob, wire: bobWire } = createDemoClient(bobIdentity);
+  const { client: alice, wire: aliceWire, dir: aliceDir } = createDemoClient(aliceIdentity);
+  const { client: bob, wire: bobWire, dir: bobDir } = createDemoClient(bobIdentity);
 
   const aliceInboundRouteSecret = randomBytes(32).toString('base64');
   const bobInboundRouteSecret = randomBytes(32).toString('base64');
@@ -99,4 +105,6 @@ test('demo flow: two clients exchange identity payloads and deliver messages', (
 
   alice.close();
   bob.close();
+  fs.rmSync(aliceDir, { recursive: true, force: true });
+  fs.rmSync(bobDir, { recursive: true, force: true });
 });
