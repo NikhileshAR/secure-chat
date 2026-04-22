@@ -36,8 +36,8 @@ const { SUPPORTED_VERSIONS, negotiateProtocolVersion } = require('../protocol/sp
 const { SessionStore } = require('./storage/sessionStore');
 const {
   KeyVault,
-  encryptBlobWithPassphrase,
-  decryptBlobWithPassphrase,
+  encryptBlobWithArgon2Passphrase,
+  decryptBlobWithArgon2Passphrase,
 } = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
 const { RelayRegistry } = require('./relayRegistry');
@@ -2378,11 +2378,11 @@ class SecureClient {
         encodeBackupValue(session),
       ]) : [],
     };
-    return encryptBlobWithPassphrase(payload, passphrase);
+    return encryptBlobWithArgon2Passphrase(payload, passphrase);
   }
 
   importBackup(blob, passphrase, { allowIdentityOverwrite = false } = {}) {
-    const parsed = decryptBlobWithPassphrase(blob, passphrase);
+    const parsed = decryptBlobWithArgon2Passphrase(blob, passphrase);
     if (!parsed || parsed.schemaVersion !== 1) {
       throw new Error('Backup schema mismatch');
     }
