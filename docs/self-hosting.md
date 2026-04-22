@@ -11,6 +11,10 @@ Or start directly from a config file:
 
 - `node deploy/start-relay.js --config relay.config.json`
 
+For public internet deployment guidance (public IP, firewall ports, CGNAT, `publicUrl`), see:
+
+- `docs/public-relay.md`
+
 ## What the relay can see
 
 A relay can see:

@@ -1,6 +1,7 @@
 {
   "host": "0.0.0.0",
   "port": 8080,
+  "publicUrl": "ws://YOUR_PUBLIC_IP_OR_DOMAIN:8080",
   "maxConnections": 1000,
   "maxBufferedBytes": 524288,
   "maxMessageSizeBytes": 65536,

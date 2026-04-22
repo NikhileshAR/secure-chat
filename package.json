@@ -5,7 +5,8 @@
   "main": "src/client/client.js",
   "scripts": {
     "test": "node --test",
-    "start:server": "node src/server/relayServer.js"
+    "start:server": "node src/server/relayServer.js",
+    "start:app": "node app/server.js"
   },
   "repository": {
     "type": "git",

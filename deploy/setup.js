@@ -26,11 +26,13 @@ function buildSetupConfig({
   maxConnections = 1000,
   logLevel = 'minimal',
   securityProfile = 'BALANCED',
+  publicUrl = '',
 } = {}) {
   const normalizedProfile = String(securityProfile || 'BALANCED').toUpperCase();
   return {
     host: '0.0.0.0',
     port: Number(port),
+    publicUrl: String(publicUrl || '').trim(),
     maxConnections: Number(maxConnections),
     maxBufferedBytes: 512 * 1024,
     maxMessageSizeBytes: 64 * 1024,
@@ -55,9 +57,10 @@ async function promptConfig() {
   const maxConnections = Number((await rl.question('Max connections (default 1000): ')).trim() || '1000');
   const logLevel = (await rl.question('Log level (minimal|debug, default minimal): ')).trim() || 'minimal';
   const securityProfile = ((await rl.question('Security profile (MAX|BALANCED, default BALANCED): ')).trim() || 'BALANCED').toUpperCase();
+  const publicUrl = (await rl.question('Public relay URL for clients (optional, e.g. ws://example.com:8080): ')).trim();
   await rl.close();
 
-  return buildSetupConfig({ port, maxConnections, logLevel, securityProfile });
+  return buildSetupConfig({ port, maxConnections, logLevel, securityProfile, publicUrl });
 }
 
 async function main() {
@@ -76,15 +79,19 @@ async function main() {
 
   const { server, relayId } = startRelay(config, { skipSystemCheck: true, printBanner: false });
   const localUrl = `ws://127.0.0.1:${config.port}`;
+  const advertisedUrl = config.publicUrl || localUrl;
   const token = randomBytes(8).toString('hex');
 
   console.log('Your private relay is running');
   console.log(`Local access URL: ${localUrl}`);
+  if (config.publicUrl) {
+    console.log(`Public access URL: ${config.publicUrl}`);
+  }
   console.log(`Relay ID: ${relayId}`);
   console.log('Scan/share this connection token (ASCII QR):');
-  console.log(asciiQr(`${localUrl}|${relayId}|${token}`));
+  console.log(asciiQr(`${advertisedUrl}|${relayId}|${token}`));
   console.log('Connection steps for users:');
-  console.log(`1) Open client settings\n2) Add relay URL: ${localUrl}\n3) Enable HARDENED OPSEC mode`);
+  console.log(`1) Open client settings\n2) Add relay URL: ${advertisedUrl}\n3) Enable HARDENED OPSEC mode`);
   console.log('Warning: This system does not allow you to read messages. It only relays encrypted data.');
 
   process.on('SIGINT', () => {
