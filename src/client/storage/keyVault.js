@@ -62,6 +62,121 @@ function deriveKeyFromStoredKdf(passphrase, kdf) {
   return pbkdf2Sync(String(passphrase || ''), salt, kdf.iterations || PBKDF2_ITERATIONS, 32, 'sha256');
 }
 
+function encryptBlobWithPassphrase(value, passphrase, options = {}) {
+  const salt = randomBytes(16);
+  const { key, kdf } = deriveKey(passphrase, salt, options);
+  const iv = randomBytes(12);
+  const plaintext = Buffer.from(JSON.stringify(value));
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const mac = createHmac('sha256', key)
+    .update(iv)
+    .update(tag)
+    .update(ciphertext)
+    .digest('base64');
+
+  return {
+    schemaVersion: KEY_VAULT_SCHEMA_VERSION,
+    kdf,
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    mac,
+    updatedAt: Date.now(),
+  };
+}
+
+function decryptBlobWithPassphrase(blob, passphrase) {
+  if (!blob || blob.schemaVersion !== KEY_VAULT_SCHEMA_VERSION) {
+    throw new Error('KeyVault unsupported schema version');
+  }
+  const key = deriveKeyFromStoredKdf(passphrase, blob.kdf);
+  const iv = Buffer.from(blob.iv, 'base64');
+  const tag = Buffer.from(blob.tag, 'base64');
+  const ciphertext = Buffer.from(blob.ciphertext, 'base64');
+  const expectedMac = createHmac('sha256', key)
+    .update(iv)
+    .update(tag)
+    .update(ciphertext)
+    .digest('base64');
+  if (expectedMac !== blob.mac) {
+    throw new Error('KeyVault authentication failed');
+  }
+
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    throw new Error('KeyVault authentication failed');
+  }
+}
+
+function encryptBlobWithArgon2Passphrase(value, passphrase) {
+  if (typeof argon2Sync !== 'function') {
+    throw new Error('Argon2 support is required for backup export');
+  }
+  const salt = randomBytes(16);
+  const key = argon2Sync('argon2id', {
+    message: Buffer.from(String(passphrase || '')),
+    nonce: salt,
+    parallelism: 1,
+    memory: 64 * 1024,
+    passes: 3,
+    tagLength: 32,
+  });
+  const iv = randomBytes(12);
+  const plaintext = Buffer.from(JSON.stringify(value));
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    schemaVersion: KEY_VAULT_SCHEMA_VERSION,
+    kdf: {
+      type: 'argon2id',
+      memory: 64 * 1024,
+      time: 3,
+      parallelism: 1,
+      salt: salt.toString('base64'),
+    },
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    updatedAt: Date.now(),
+  };
+}
+
+function decryptBlobWithArgon2Passphrase(blob, passphrase) {
+  if (!blob || blob?.kdf?.type !== 'argon2id') {
+    throw new Error('Backup must use argon2id KDF');
+  }
+  if (typeof argon2Sync !== 'function') {
+    throw new Error('Argon2 support is required for backup import');
+  }
+  const salt = Buffer.from(blob.kdf.salt, 'base64');
+  const key = argon2Sync('argon2id', {
+    message: Buffer.from(String(passphrase || '')),
+    nonce: salt,
+    parallelism: blob.kdf.parallelism || 1,
+    memory: blob.kdf.memory || 64 * 1024,
+    passes: blob.kdf.time || 3,
+    tagLength: 32,
+  });
+  const iv = Buffer.from(blob.iv, 'base64');
+  const tag = Buffer.from(blob.tag, 'base64');
+  const ciphertext = Buffer.from(blob.ciphertext, 'base64');
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    throw new Error('KeyVault authentication failed');
+  }
+}
+
 class KeyVault {
   constructor({ storageDir, filename = 'securechat.keys.enc' }) {
     if (!storageDir) {
@@ -76,33 +191,10 @@ class KeyVault {
     if (!identityPrivateKey || !devicePrivateKey) {
       throw new Error('KeyVault requires both identityPrivateKey and devicePrivateKey');
     }
-    const salt = randomBytes(16);
-    const { key, kdf } = deriveKey(passphrase, salt, options);
-    const iv = randomBytes(12);
-
-    const plaintext = Buffer.from(JSON.stringify({
+    const payload = encryptBlobWithPassphrase({
       identityPrivateKey,
       devicePrivateKey,
-    }));
-
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    const mac = createHmac('sha256', key)
-      .update(iv)
-      .update(tag)
-      .update(ciphertext)
-      .digest('base64');
-
-    const payload = {
-      schemaVersion: KEY_VAULT_SCHEMA_VERSION,
-      kdf,
-      iv: iv.toString('base64'),
-      tag: tag.toString('base64'),
-      ciphertext: ciphertext.toString('base64'),
-      mac,
-      updatedAt: Date.now(),
-    };
+    }, passphrase, options);
 
     fs.mkdirSync(this.storageDir, { recursive: true });
     const tmpPath = `${this.filePath}.tmp`;
@@ -114,28 +206,7 @@ class KeyVault {
   unlock(passphrase) {
     const raw = fs.readFileSync(this.filePath, 'utf8');
     const payload = JSON.parse(raw);
-    if (payload.schemaVersion !== KEY_VAULT_SCHEMA_VERSION) {
-      throw new Error('KeyVault unsupported schema version');
-    }
-
-    const key = deriveKeyFromStoredKdf(passphrase, payload.kdf);
-    const iv = Buffer.from(payload.iv, 'base64');
-    const tag = Buffer.from(payload.tag, 'base64');
-    const ciphertext = Buffer.from(payload.ciphertext, 'base64');
-
-    const expectedMac = createHmac('sha256', key)
-      .update(iv)
-      .update(tag)
-      .update(ciphertext)
-      .digest('base64');
-    if (expectedMac !== payload.mac) {
-      throw new Error('KeyVault authentication failed');
-    }
-
-    const decipher = createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(tag);
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    const parsed = JSON.parse(plaintext.toString('utf8'));
+    const parsed = decryptBlobWithPassphrase(payload, passphrase);
 
     this.unlockedKeys = {
       identityPrivateKey: parsed.identityPrivateKey,
@@ -171,4 +242,8 @@ class KeyVault {
 module.exports = {
   KeyVault,
   KEY_VAULT_SCHEMA_VERSION,
+  encryptBlobWithPassphrase,
+  decryptBlobWithPassphrase,
+  encryptBlobWithArgon2Passphrase,
+  decryptBlobWithArgon2Passphrase,
 };

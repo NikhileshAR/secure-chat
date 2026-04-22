@@ -34,8 +34,13 @@ const { encodeMessage, decodeMessage } = require('../protocol/wire');
 const { assertInvariant } = require('../protocol/invariants');
 const { SUPPORTED_VERSIONS, negotiateProtocolVersion } = require('../protocol/spec');
 const { SessionStore } = require('./storage/sessionStore');
-const { KeyVault } = require('./storage/keyVault');
+const {
+  KeyVault,
+  encryptBlobWithArgon2Passphrase,
+  decryptBlobWithArgon2Passphrase,
+} = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
+const { RelayRegistry } = require('./relayRegistry');
 const {
   SecurityStateEngine,
   SECURITY_EVENTS,
@@ -90,6 +95,43 @@ const DEFAULT_SECURITY_THRESHOLDS = {
   replayAttempts: 20,
   droppedMessages: 32,
 };
+const OPSEC_MODES = {
+  NORMAL: 'NORMAL',
+  HARDENED: 'HARDENED',
+};
+const DEFAULT_KEY_VAULT_AUTO_LOCK_TIMEOUT_MS = 60_000;
+
+function encodeBackupValue(value) {
+  if (Buffer.isBuffer(value)) {
+    return { __type: 'Buffer', data: value.toString('base64') };
+  }
+  if (value instanceof Map) {
+    return { __type: 'Map', data: [...value.entries()].map(([key, item]) => [key, encodeBackupValue(item)]) };
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => encodeBackupValue(item));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodeBackupValue(item)]));
+  }
+  return value;
+}
+
+function decodeBackupValue(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  if (value.__type === 'Buffer') {
+    return Buffer.from(value.data, 'base64');
+  }
+  if (value.__type === 'Map') {
+    return new Map((value.data || []).map(([key, item]) => [key, decodeBackupValue(item)]));
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => decodeBackupValue(item));
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decodeBackupValue(item)]));
+}
 
 function normalizeRange(range, fallback) {
   const min = Number(range?.min ?? fallback.min);
@@ -168,6 +210,11 @@ class SecureClient {
     environmentRiskEvaluator = getEnvironmentRisk,
     strictWireMode,
     supportedVersions = SUPPORTED_VERSIONS,
+    opsecMode = OPSEC_MODES.NORMAL,
+    keyVaultAutoLockTimeoutMs = DEFAULT_KEY_VAULT_AUTO_LOCK_TIMEOUT_MS,
+    maxActiveSessions = 512,
+    relayRegistry,
+    relaySelectionStrategy = 'FIXED',
   }) {
     const rawConfig = {
       mode: process.env.NODE_ENV,
@@ -197,7 +244,12 @@ class SecureClient {
     const effectivePullNoiseLevel = safeConfig.pullNoiseLevel;
     const effectiveConstantTrafficEnabled = safeConfig.constantTrafficEnabled;
     const effectiveRateShaping = safeConfig.rateShaping || rateShaping;
-    const effectiveStrictWireMode = safeConfig.strictWireMode;
+    const effectiveOpsecMode = String(opsecMode || OPSEC_MODES.NORMAL).toUpperCase() === OPSEC_MODES.HARDENED
+      ? OPSEC_MODES.HARDENED
+      : OPSEC_MODES.NORMAL;
+    const effectiveStrictWireMode = effectiveOpsecMode === OPSEC_MODES.HARDENED
+      ? true
+      : safeConfig.strictWireMode;
 
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -213,6 +265,7 @@ class SecureClient {
     this.sessions = new Map();
     this.knownPeerIdentities = new Map();
     this.securityProfile = safeConfig.securityProfile;
+    this.opsecMode = effectiveOpsecMode;
     this.productionMode = safeConfig.productionMode;
     this.paddingSizeBuckets = normalizePaddingBuckets(effectivePaddingSizeBuckets);
     this.coverTrafficIntervalRangeMs = normalizeRange(
@@ -225,7 +278,10 @@ class SecureClient {
       : DEFAULT_BATCHING_WINDOW_MS);
     this.parallelRouteTags = Math.max(1, Number(parallelRouteTags) || DEFAULT_PARALLEL_ROUTE_TAGS);
     this.pullNoiseLevel = Math.max(0, Number(effectivePullNoiseLevel) || 0);
-    this.pullIntervalJitterMs = Math.max(0, Number(pullIntervalJitterMs) || 0);
+    this.pullIntervalJitterMs = Math.max(
+      effectiveOpsecMode === OPSEC_MODES.HARDENED ? DEFAULT_PULL_INTERVAL_JITTER_MS : 0,
+      Number(pullIntervalJitterMs) || 0,
+    );
     this.constantTrafficEnabled = Boolean(effectiveConstantTrafficEnabled);
     this.constantTrafficRatePerSecond = Math.max(
       0.1,
@@ -260,6 +316,9 @@ class SecureClient {
       ),
     );
     this.decoySessionCount = Math.max(0, Number(decoySessionCount) || 0);
+    this.maxActiveSessions = Math.max(4, Number(maxActiveSessions) || 512);
+    this.relaySelectionStrategy = String(relaySelectionStrategy || 'FIXED').toUpperCase();
+    this.relayRegistry = relayRegistry || new RelayRegistry();
 
     const minMessagesPerSecond = Number(effectiveRateShaping?.minMessagesPerSecond);
     const maxMessagesPerSecond = Number(effectiveRateShaping?.maxMessagesPerSecond);
@@ -333,6 +392,8 @@ class SecureClient {
       })
       : null);
     this.keyVault = keyVault || (keyVaultStorageDir ? new KeyVault({ storageDir: keyVaultStorageDir }) : null);
+    this.keyVaultAutoLockTimeoutMs = Math.max(1_000, Number(keyVaultAutoLockTimeoutMs) || DEFAULT_KEY_VAULT_AUTO_LOCK_TIMEOUT_MS);
+    this.keyVaultAutoLockTimer = null;
     this.trustStore = trustStore || ((trustStoreStorageDir || sessionStorageDir) && deviceSecret
       ? new TrustStore({
         storageDir: trustStoreStorageDir || sessionStorageDir,
@@ -345,6 +406,9 @@ class SecureClient {
     }
     if (this.trustStore) {
       this.trustStore.loadTrust();
+    }
+    if (this.serverUrl) {
+      this.relayRegistry.addRelay(this.serverUrl, 'default');
     }
     this.evaluateEnvironmentRisk();
     this.securityState.subscribe((state) => {
@@ -687,6 +751,7 @@ class SecureClient {
       identityPrivateKey: this.identity.identityKeyPair.privateKey,
       devicePrivateKey: this.identity.deviceKeyPair.privateKey,
     }, passphrase, options);
+    this.touchKeyVaultActivity();
   }
 
   unlockPrivateKeys(passphrase) {
@@ -705,7 +770,66 @@ class SecureClient {
         privateKey: unlocked.devicePrivateKey,
       },
     };
+    this.touchKeyVaultActivity();
     return unlocked;
+  }
+
+  touchKeyVaultActivity() {
+    if (!this.keyVault) {
+      return;
+    }
+    if (this.keyVaultAutoLockTimer) {
+      clearTimeout(this.keyVaultAutoLockTimer);
+      this.keyVaultAutoLockTimer = null;
+    }
+    this.keyVaultAutoLockTimer = setTimeout(() => {
+      this.keyVaultAutoLockTimer = null;
+      this.keyVault.clearUnlockedKeys();
+      this.appendSecurityEvent('keyvault_auto_locked', { timeoutMs: this.keyVaultAutoLockTimeoutMs });
+    }, this.keyVaultAutoLockTimeoutMs);
+  }
+
+  addRelay(url, label) {
+    this.relayRegistry.addRelay(url, label);
+    return this.listRelays();
+  }
+
+  removeRelay(url) {
+    this.relayRegistry.removeRelay(url);
+    return this.listRelays();
+  }
+
+  listRelays() {
+    return this.relayRegistry.listRelays();
+  }
+
+  selectRelay() {
+    if (this.relaySelectionStrategy === 'RANDOM_PER_SESSION') {
+      return this.relayRegistry.chooseRandomRelay();
+    }
+    if (this.relaySelectionStrategy === 'ROTATE') {
+      return this.relayRegistry.chooseNextRelay();
+    }
+    if (this.serverUrl) {
+      return { url: this.serverUrl };
+    }
+    return this.relayRegistry.chooseNextRelay();
+  }
+
+  async connectToRelay(url) {
+    const nextUrl = String(url || '').trim();
+    if (!nextUrl) {
+      throw new Error('Relay URL is required');
+    }
+    this.relayRegistry.addRelay(nextUrl, 'manual');
+    this.serverUrl = nextUrl;
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+    await this.connect();
+    this.relayRegistry.markSeen(nextUrl);
+    return nextUrl;
   }
 
   trackAck(envelope) {
@@ -766,6 +890,13 @@ class SecureClient {
   }
 
   async connect() {
+    if (!this.serverUrl) {
+      const selectedRelay = this.selectRelay();
+      if (!selectedRelay?.url) {
+        throw new Error('No relay URL configured');
+      }
+      this.serverUrl = selectedRelay.url;
+    }
     this.socket = new WebSocket(this.serverUrl);
 
     await new Promise((resolve, reject) => {
@@ -797,6 +928,7 @@ class SecureClient {
     }
     this.startAckRetryLoop();
     this.startCoverTraffic();
+    this.relayRegistry.markSeen(this.serverUrl);
   }
 
   sendRaw(message) {
@@ -1005,11 +1137,26 @@ class SecureClient {
       expiresAt: now + this.sessionTtlMs,
       lastActivityAt: now,
       isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith(DECOY_SESSION_PREFIX),
+      preferredRelayUrl: this.selectRelay()?.url || this.serverUrl || null,
     };
 
     this.sessions.set(sessionId, session);
+    this.pruneActiveSessions();
     this.persistSessions();
     return session;
+  }
+
+  pruneActiveSessions() {
+    if (this.sessions.size <= this.maxActiveSessions) {
+      return;
+    }
+    const sorted = [...this.sessions.entries()]
+      .sort((a, b) => (a[1]?.lastActivityAt || 0) - (b[1]?.lastActivityAt || 0));
+    const overflow = this.sessions.size - this.maxActiveSessions;
+    for (let i = 0; i < overflow; i += 1) {
+      this.sessions.delete(sorted[i][0]);
+    }
+    this.appendSecurityEvent('sessions_pruned', { removed: overflow, maxActiveSessions: this.maxActiveSessions });
   }
 
   ensureDecoySessions() {
@@ -1208,6 +1355,10 @@ class SecureClient {
     const envelope = { ...baseMessage, signature };
     this.queueOutboundMessage(envelope, { sessionId: this.getSessionId({ peerDeviceId: recipientDeviceId, peerDevicePublicKey: recipientDevicePublicKey, routeSecret }) });
     this.trackAck(envelope);
+    if (this.opsecMode === OPSEC_MODES.HARDENED && this.keyVault && !this.keyVault.isLocked()) {
+      this.keyVault.clearUnlockedKeys();
+    }
+    this.touchKeyVaultActivity();
     this.persistSessions();
     return envelope;
   }
@@ -1340,8 +1491,12 @@ class SecureClient {
     if (!sessionCount) {
       return null;
     }
-    const index = this.dummySessionRoundRobin % sessionCount;
-    this.dummySessionRoundRobin += 1;
+    const index = this.opsecMode === OPSEC_MODES.HARDENED
+      ? randomInt(sessionCount)
+      : this.dummySessionRoundRobin % sessionCount;
+    if (this.opsecMode !== OPSEC_MODES.HARDENED) {
+      this.dummySessionRoundRobin += 1;
+    }
     return sessions[index];
   }
 
@@ -1819,7 +1974,10 @@ class SecureClient {
       const jitter = this.pullIntervalJitterMs > 0
         ? randomInt(-this.pullIntervalJitterMs, this.pullIntervalJitterMs + 1)
         : 0;
-      const nextInterval = Math.max(0, this.autoPullBaseIntervalMs + jitter);
+      const hardenedJitter = this.opsecMode === OPSEC_MODES.HARDENED
+        ? randomInt(-100, 101)
+        : 0;
+      const nextInterval = Math.max(0, this.autoPullBaseIntervalMs + jitter + hardenedJitter);
       this.autoPullTimer = setTimeout(() => {
         this.autoPullTimer = null;
         this.pull(this.autoPullRouteSecrets, { window });
@@ -2167,6 +2325,9 @@ class SecureClient {
   }
 
   setStrictWireMode(enabled, confirmation = {}) {
+    if (this.opsecMode === OPSEC_MODES.HARDENED && !enabled) {
+      throw new Error('strictWireMode cannot be disabled in HARDENED opsec mode');
+    }
     if (!enabled) {
       this.confirmSensitiveAction({
         action: 'disableStrictWireMode',
@@ -2180,6 +2341,9 @@ class SecureClient {
   }
 
   exportSecurityLog(filePath, passphrase, confirmation = {}) {
+    if (this.opsecMode === OPSEC_MODES.HARDENED && (!confirmation.confirmed || !confirmation.secondConfirmed)) {
+      throw new Error('exportSecurityLog blocked in HARDENED mode without double confirmation');
+    }
     this.confirmSensitiveAction({
       action: 'exportSecurityLog',
       fingerprint: this.getConfigFingerprint(),
@@ -2190,6 +2354,9 @@ class SecureClient {
   }
 
   exportPrivateKeys(passphrase, confirmation = {}) {
+    if (this.opsecMode === OPSEC_MODES.HARDENED) {
+      throw new Error('exportPrivateKeys is blocked in HARDENED opsec mode');
+    }
     this.confirmSensitiveAction({
       action: 'exportPrivateKeys',
       fingerprint: this.getConfigFingerprint(),
@@ -2199,9 +2366,60 @@ class SecureClient {
     return this.unlockPrivateKeys(passphrase);
   }
 
+  exportBackup(passphrase, { includeSessions = true } = {}) {
+    const payload = {
+      schemaVersion: 1,
+      createdAt: Date.now(),
+      opsecMode: this.opsecMode,
+      identity: this.identity,
+      trustEntries: this.trustStore ? this.trustStore.list() : [],
+      sessions: includeSessions ? [...this.sessions.entries()].map(([sessionId, session]) => [
+        sessionId,
+        encodeBackupValue(session),
+      ]) : [],
+    };
+    return encryptBlobWithArgon2Passphrase(payload, passphrase);
+  }
+
+  importBackup(blob, passphrase, { allowIdentityOverwrite = false } = {}) {
+    const parsed = decryptBlobWithArgon2Passphrase(blob, passphrase);
+    if (!parsed || parsed.schemaVersion !== 1) {
+      throw new Error('Backup schema mismatch');
+    }
+    if (!parsed.identity || !parsed.identity.identityKeyPair || !parsed.identity.deviceKeyPair) {
+      throw new Error('Backup is missing identity keys');
+    }
+    const currentIdentity = this.identity?.identityKeyPair?.publicKey;
+    const nextIdentity = parsed.identity.identityKeyPair.publicKey;
+    if (currentIdentity && currentIdentity !== nextIdentity && !allowIdentityOverwrite) {
+      this.appendSecurityEvent('backup_identity_overwrite_warning', {
+        currentFingerprint: formatIdentityFingerprint(currentIdentity),
+        incomingFingerprint: formatIdentityFingerprint(nextIdentity),
+      });
+      throw new Error('Backup import would overwrite existing identity');
+    }
+
+    this.identity = parsed.identity;
+    if (this.trustStore) {
+      const map = new Map((parsed.trustEntries || []).map((entry) => [entry.fingerprint, entry]));
+      this.trustStore.saveTrust(map);
+      this.trustStore.loadTrust();
+    }
+    if (Array.isArray(parsed.sessions) && parsed.sessions.length) {
+      this.sessions = new Map(parsed.sessions.map(([sessionId, session]) => [sessionId, decodeBackupValue(session)]));
+      this.pruneActiveSessions();
+      this.persistSessions();
+    }
+    return {
+      importedSessions: this.sessions.size,
+      importedTrustEntries: parsed.trustEntries?.length || 0,
+    };
+  }
+
   getConfigFingerprint() {
     const configSnapshot = {
       securityProfile: this.securityProfile,
+      opsecMode: this.opsecMode,
       productionMode: this.productionMode,
       strictWireMode: this.strictWireMode,
       constantTrafficEnabled: this.constantTrafficEnabled,
@@ -2225,6 +2443,10 @@ class SecureClient {
     this.stopCoverTraffic();
     this.stopAutoPull();
     this.stopAckRetryLoop();
+    if (this.keyVaultAutoLockTimer) {
+      clearTimeout(this.keyVaultAutoLockTimer);
+      this.keyVaultAutoLockTimer = null;
+    }
     this.persistSessions();
     if (this.socket) {
       this.socket.close();
@@ -2236,4 +2458,5 @@ class SecureClient {
 module.exports = {
   SecureClient,
   SekureClient: SecureClient,
+  OPSEC_MODES,
 };
