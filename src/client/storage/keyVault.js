@@ -116,7 +116,7 @@ function decryptBlobWithPassphrase(blob, passphrase) {
 
 function encryptBlobWithArgon2Passphrase(value, passphrase) {
   if (typeof argon2Sync !== 'function') {
-    return encryptBlobWithPassphrase(value, passphrase, { preferArgon2: false });
+    throw new Error('Argon2 support is required for backup export');
   }
   const salt = randomBytes(16);
   const key = argon2Sync('argon2id', {
