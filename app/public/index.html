@@ -10,7 +10,7 @@
     <h1>Secure Chat Demo</h1>
 
     <section>
-      <h2>Connection</h2>
+      <h2>Connect</h2>
       <div class="row">
         <input id="relayUrl" placeholder="ws://relay-host:8080" />
         <button id="connectBtn">Connect</button>
@@ -18,13 +18,20 @@
       <div class="row">
         <input id="configFile" type="file" accept="application/json" />
       </div>
-      <p id="connectionStatus">Status: DISCONNECTED</p>
+      <p id="connectionStatus">● Disconnected</p>
+      <p id="relayStatus"></p>
     </section>
 
     <section>
       <h2>Identity</h2>
+      <div class="row">
+        <input id="deviceName" placeholder="Device name" />
+        <button id="saveDeviceNameBtn">Save Name</button>
+        <button id="resetIdentityBtn">Reset Identity</button>
+      </div>
       <p><strong>Fingerprint:</strong> <span id="fingerprint"></span></p>
-      <button id="shareIdentityBtn">Share Identity</button>
+      <p><strong>Short ID:</strong> <span id="shortId"></span></p>
+      <button id="shareIdentityBtn">Share My Identity</button>
       <div id="sharePanel" class="hidden">
         <img id="shareQr" alt="Identity QR" />
         <textarea id="shareText" readonly></textarea>
@@ -45,6 +52,12 @@
       </div>
       <p id="scanStatus"></p>
       <ul id="contactsList"></ul>
+      <div id="contactInfo" class="contact-info hidden">
+        <h3>Contact Info</h3>
+        <p><strong>Fingerprint:</strong> <span id="contactFingerprint"></span></p>
+        <p><strong>Trust:</strong> <span id="contactTrust"></span></p>
+        <p><strong>Short ID:</strong> <span id="contactShortId"></span></p>
+      </div>
     </section>
 
     <section>
@@ -56,6 +69,16 @@
       <div class="row">
         <input id="chatInput" placeholder="Type a message" />
         <button id="sendBtn">Send</button>
+      </div>
+    </section>
+
+    <section>
+      <button id="toggleDebugBtn">Show Debug Info</button>
+      <div id="debugPanel" class="hidden debug-panel">
+        <p><strong>Fingerprint:</strong> <span id="debugFingerprint"></span></p>
+        <p><strong>Relay URL:</strong> <span id="debugRelay"></span></p>
+        <p><strong>Connection:</strong> <span id="debugConnection"></span></p>
+        <p><strong>Session Count:</strong> <span id="debugSessions"></span></p>
       </div>
     </section>
 

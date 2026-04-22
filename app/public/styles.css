@@ -1,7 +1,7 @@
 body {
   font-family: sans-serif;
   margin: 1rem;
-  max-width: 900px;
+  max-width: 960px;
 }
 
 section {
@@ -43,20 +43,43 @@ textarea {
 .messages {
   border: 1px solid #ddd;
   min-height: 200px;
-  max-height: 300px;
+  max-height: 320px;
   overflow: auto;
   padding: 0.5rem;
   margin-bottom: 0.5rem;
   background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
 .msg {
-  margin-bottom: 0.5rem;
-  padding-bottom: 0.4rem;
-  border-bottom: 1px dashed #ddd;
+  max-width: 75%;
+  padding: 0.5rem;
+  border-radius: 10px;
+  border: 1px solid #ddd;
+}
+
+.msg.you {
+  align-self: flex-end;
+  background: #e8f5ff;
+}
+
+.msg.peer {
+  align-self: flex-start;
+  background: #fff;
 }
 
 .msg .meta {
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   color: #555;
+  margin-bottom: 0.2rem;
+}
+
+.contact-info,
+.debug-panel {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 0.6rem;
+  background: #fcfcfc;
 }
