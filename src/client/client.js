@@ -27,11 +27,20 @@ const {
   normalizePaddingBuckets,
   encryptPayloadWithMessageKey,
   decryptPayloadWithMessageKey,
+  secureZero,
 } = require('./crypto');
 const { validateMessage, PROTOCOL_VERSION } = require('../protocol/schema');
 const { SessionStore } = require('./storage/sessionStore');
 const { KeyVault } = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
+const {
+  SecurityStateEngine,
+  SECURITY_EVENTS,
+  IDENTITY_INTEGRITY,
+  SESSION_HEALTH,
+  ENVIRONMENT_RISK,
+} = require('./securityState');
+const { SecurityLog } = require('./securityLog');
 
 const REQUIRED_CHAT_FIELDS = [
   'type',
@@ -61,6 +70,17 @@ const DEFAULT_INBOUND_DELAY_RANGE_MS = { min: 5, max: 35 };
 const DEFAULT_SMOOTHING_WINDOW_MS = 5_000;
 const DEFAULT_SMOOTHING_VARIANCE = 0.15;
 const DECOY_SESSION_PREFIX = '_decoy_session:';
+const DEFAULT_LONG_INACTIVITY_MS = 10 * 60_000;
+const DEFAULT_MAX_QUARANTINE_MESSAGES = 128;
+const DEFAULT_SECURITY_THRESHOLDS = {
+  handshakeMismatches: 6,
+  routeTagMismatches: 24,
+  invalidSignatures: 12,
+  relayFloodMessages: 120,
+  burstWindowMs: 2_500,
+  replayAttempts: 20,
+  droppedMessages: 32,
+};
 
 function normalizeRange(range, fallback) {
   const min = Number(range?.min ?? fallback.min);
@@ -118,6 +138,11 @@ class SecureClient {
     trustStoreStorageDir,
     ackRetryIntervalMs = 2_000,
     ackMaxRetries = 5,
+    longInactivityMs = DEFAULT_LONG_INACTIVITY_MS,
+    maxQuarantineMessages = DEFAULT_MAX_QUARANTINE_MESSAGES,
+    securityThresholds = DEFAULT_SECURITY_THRESHOLDS,
+    securityState,
+    securityLog,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -214,6 +239,26 @@ class SecureClient {
     this.ackRetryIntervalMs = Math.max(250, Number(ackRetryIntervalMs) || 2_000);
     this.ackMaxRetries = Math.max(1, Number(ackMaxRetries) || 5);
     this.ackRetryTimer = null;
+    this.longInactivityMs = Math.max(30_000, Number(longInactivityMs) || DEFAULT_LONG_INACTIVITY_MS);
+    this.maxQuarantineMessages = Math.max(16, Number(maxQuarantineMessages) || DEFAULT_MAX_QUARANTINE_MESSAGES);
+    this.securityThresholds = {
+      ...DEFAULT_SECURITY_THRESHOLDS,
+      ...(securityThresholds || {}),
+    };
+    this.safeMode = false;
+    this.manualResumeRequired = false;
+    this.quarantineQueue = [];
+    this.securityState = securityState || new SecurityStateEngine();
+    this.securityLog = securityLog || new SecurityLog();
+    this.securityMetrics = {
+      handshakeMismatches: 0,
+      routeTagMismatches: 0,
+      invalidSignatures: 0,
+      replayAttempts: 0,
+      droppedMessages: 0,
+      messageFailures: 0,
+      inboundTimestamps: [],
+    };
 
     this.sessionStore = sessionStore || (sessionStorageDir && deviceSecret
       ? new SessionStore({
@@ -237,6 +282,11 @@ class SecureClient {
     if (this.trustStore) {
       this.trustStore.loadTrust();
     }
+    this.securityState.subscribe((state) => {
+      if (!this.safeMode && state.sessionHealth === SESSION_HEALTH.HEALTHY) {
+        this.retryQuarantinedMessages();
+      }
+    });
   }
 
   loadPersistedSessions() {
@@ -244,6 +294,17 @@ class SecureClient {
       const loaded = this.sessionStore.loadSessions();
       if (loaded instanceof Map) {
         this.sessions = loaded;
+        const now = Date.now();
+        for (const session of this.sessions.values()) {
+          if (session && typeof session === 'object') {
+            session.ratchetPending = true;
+            session.forceRatchetOnNextSend = true;
+            session.lastActivityAt = now;
+            if (session.skippedMessageKeys instanceof Map) {
+              session.skippedMessageKeys.clear();
+            }
+          }
+        }
       }
     } catch (error) {
       this.sessions = new Map();
@@ -258,6 +319,188 @@ class SecureClient {
       return;
     }
     this.sessionStore.saveSessions(this.sessions);
+  }
+
+  appendSecurityEvent(type, details = {}) {
+    this.securityLog.append(type, details);
+  }
+
+  updateSecurityState(event) {
+    const state = this.securityState.updateState(event);
+    this.appendSecurityEvent('security_state_update', {
+      event: typeof event === 'string' ? event : event?.type,
+      state,
+    });
+    return state;
+  }
+
+  getCurrentSecurityState() {
+    return this.securityState.getCurrentState();
+  }
+
+  subscribeSecurityState(callback) {
+    return this.securityState.subscribe(callback);
+  }
+
+  getSecuritySummary({ identityPublicKey } = {}) {
+    const state = this.getCurrentSecurityState();
+    const warnings = [];
+    if (this.safeMode) {
+      warnings.push('SAFE_MODE_ACTIVE');
+    }
+    if (state.identityIntegrity === IDENTITY_INTEGRITY.CHANGED) {
+      warnings.push('IDENTITY_CHANGED');
+    }
+    if (state.sessionHealth === SESSION_HEALTH.SUSPECT) {
+      warnings.push('SESSION_SUSPECT');
+    }
+    if (state.environmentRisk !== ENVIRONMENT_RISK.LOW) {
+      warnings.push(`ENVIRONMENT_RISK_${state.environmentRisk}`);
+    }
+    if (this.quarantineQueue.length) {
+      warnings.push('QUARANTINED_MESSAGES_PENDING');
+    }
+    return {
+      trustLevel: identityPublicKey ? (this.getTrustLevel(identityPublicKey) || state.trustLevel) : state.trustLevel,
+      fingerprintStatus: state.identityIntegrity,
+      warnings,
+    };
+  }
+
+  trackInboundTiming() {
+    const now = Date.now();
+    const cutoff = now - this.securityThresholds.burstWindowMs;
+    this.securityMetrics.inboundTimestamps.push(now);
+    this.securityMetrics.inboundTimestamps = this.securityMetrics.inboundTimestamps
+      .filter((timestamp) => timestamp >= cutoff);
+    if (this.securityMetrics.inboundTimestamps.length >= this.securityThresholds.relayFloodMessages) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.RELAY_FLOODING_DETECTED });
+      this.enterSafeMode('relay_flooding_detected');
+      return true;
+    }
+    if (this.securityMetrics.inboundTimestamps.length >= Math.max(8, this.securityThresholds.relayFloodMessages / 2)) {
+      const delta = this.securityMetrics.inboundTimestamps[this.securityMetrics.inboundTimestamps.length - 1]
+        - this.securityMetrics.inboundTimestamps[0];
+      if (delta < Math.max(300, this.securityThresholds.burstWindowMs / 4)) {
+        this.updateSecurityState({ type: SECURITY_EVENTS.ABNORMAL_TIMING_BURST });
+        this.enterSafeMode('abnormal_timing_burst');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  incrementSecurityMetric(metricName) {
+    if (!Object.prototype.hasOwnProperty.call(this.securityMetrics, metricName)) {
+      return;
+    }
+    this.securityMetrics[metricName] += 1;
+    const thresholds = this.securityThresholds;
+    if (
+      metricName === 'handshakeMismatches'
+      && this.securityMetrics.handshakeMismatches >= thresholds.handshakeMismatches
+    ) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.HANDSHAKE_MISMATCH_SPIKE });
+      this.enterSafeMode('handshake_mismatch_spike');
+      return;
+    }
+    if (
+      metricName === 'routeTagMismatches'
+      && this.securityMetrics.routeTagMismatches >= thresholds.routeTagMismatches
+    ) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.ROUTE_TAG_MISMATCH_SPIKE });
+      this.enterSafeMode('route_tag_mismatch_spike');
+      return;
+    }
+    if (
+      metricName === 'invalidSignatures'
+      && this.securityMetrics.invalidSignatures >= thresholds.invalidSignatures
+    ) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.INVALID_SIGNATURE_SPIKE });
+      this.enterSafeMode('invalid_signature_spike');
+      return;
+    }
+    if (
+      metricName === 'replayAttempts'
+      && this.securityMetrics.replayAttempts >= thresholds.replayAttempts
+    ) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.EXCESSIVE_REPLAY_ATTEMPTS });
+    }
+    if (
+      metricName === 'droppedMessages'
+      && this.securityMetrics.droppedMessages >= thresholds.droppedMessages
+    ) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.HIGH_DROPPED_MESSAGE_RATE });
+    }
+    if (metricName === 'messageFailures' && this.securityMetrics.messageFailures >= 5) {
+      this.updateSecurityState({ type: SECURITY_EVENTS.REPEATED_MESSAGE_FAILURES });
+    }
+  }
+
+  enterSafeMode(reason) {
+    if (this.safeMode) {
+      return;
+    }
+    this.safeMode = true;
+    this.manualResumeRequired = true;
+    this.stopAutoPull();
+    if (this.socket && this.socket.readyState === this.socket.OPEN) {
+      this.startCoverTraffic();
+    }
+    this.appendSecurityEvent('safe_mode_entered', { reason });
+  }
+
+  resumeFromSafeMode() {
+    this.safeMode = false;
+    this.manualResumeRequired = false;
+    this.securityMetrics.handshakeMismatches = 0;
+    this.securityMetrics.routeTagMismatches = 0;
+    this.securityMetrics.invalidSignatures = 0;
+    this.securityMetrics.replayAttempts = 0;
+    this.securityMetrics.messageFailures = 0;
+    this.securityMetrics.droppedMessages = 0;
+    this.updateSecurityState({ type: SECURITY_EVENTS.STATE_STABILIZED });
+    this.appendSecurityEvent('safe_mode_resumed', {});
+    this.retryQuarantinedMessages();
+  }
+
+  shouldQuarantineMessages() {
+    const state = this.getCurrentSecurityState();
+    return state.sessionHealth === SESSION_HEALTH.SUSPECT;
+  }
+
+  quarantineInboundMessage(params) {
+    if (this.quarantineQueue.length >= this.maxQuarantineMessages) {
+      this.quarantineQueue.shift();
+    }
+    this.quarantineQueue.push({
+      queuedAt: Date.now(),
+      params,
+    });
+    this.incrementSecurityMetric('droppedMessages');
+    this.appendSecurityEvent('message_quarantined', {
+      senderDeviceId: params?.message?.senderDeviceId,
+      messageId: params?.message?.messageId,
+    });
+  }
+
+  retryQuarantinedMessages() {
+    if (this.safeMode || this.shouldQuarantineMessages() || !this.quarantineQueue.length) {
+      return [];
+    }
+    const queue = this.quarantineQueue.splice(0, this.quarantineQueue.length);
+    const outputs = [];
+    for (const entry of queue) {
+      try {
+        outputs.push(this.decryptChat(entry.params));
+      } catch (error) {
+        this.incrementSecurityMetric('messageFailures');
+        this.appendSecurityEvent('quarantine_retry_failed', {
+          message: error.message,
+        });
+      }
+    }
+    return outputs.filter(Boolean);
   }
 
   startAckRetryLoop() {
@@ -385,6 +628,12 @@ class SecureClient {
         postQuantumDevice: this.postQuantumPublicKey,
       },
     });
+    for (const session of this.sessions.values()) {
+      if (session && typeof session === 'object') {
+        session.ratchetPending = true;
+        session.forceRatchetOnNextSend = true;
+      }
+    }
     this.startAckRetryLoop();
     this.startCoverTraffic();
   }
@@ -494,6 +743,7 @@ class SecureClient {
 
   touchSession(session, now = Date.now()) {
     session.expiresAt = now + this.sessionTtlMs;
+    session.lastActivityAt = now;
   }
 
   rememberPeerIdentity(peerDeviceId, peerIdentityPublicKey, { allowChange = false } = {}) {
@@ -552,6 +802,10 @@ class SecureClient {
       ) {
         this.sessions.delete(sessionId);
       } else {
+        if (typeof existing.lastActivityAt === 'number' && now - existing.lastActivityAt > this.longInactivityMs) {
+          existing.ratchetPending = true;
+          existing.forceRatchetOnNextSend = true;
+        }
         this.touchSession(existing, now);
         this.persistSessions();
         return existing;
@@ -586,7 +840,9 @@ class SecureClient {
       selfDHKeyPair: this.identity.deviceKeyPair,
       currentReceiveDhKey: peerDevicePublicKey,
       ratchetPending: false,
+      forceRatchetOnNextSend: false,
       expiresAt: now + this.sessionTtlMs,
+      lastActivityAt: now,
       isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith(DECOY_SESSION_PREFIX),
     };
 
@@ -621,10 +877,11 @@ class SecureClient {
   }
 
   pruneSkippedMessageKeys(session) {
-    if (session.skippedMessageKeys.size <= this.maxSkippedMessageKeys) {
+    const boundedMax = Math.min(this.maxSkippedMessageKeys, 128);
+    if (session.skippedMessageKeys.size <= boundedMax) {
       return;
     }
-    const overflow = session.skippedMessageKeys.size - this.maxSkippedMessageKeys;
+    const overflow = session.skippedMessageKeys.size - boundedMax;
     const keys = session.skippedMessageKeys.keys();
     for (let i = 0; i < overflow; i += 1) {
       const next = keys.next();
@@ -641,21 +898,45 @@ class SecureClient {
     const devicePublicKey = handshakeMessage.devicePublicKey
       || handshakeMessage.publicKeys?.classicalDevice;
 
-    return verifyDeviceKeyBinding(
+    const valid = verifyDeviceKeyBinding(
       identityPublicKey,
       devicePublicKey,
       handshakeMessage.deviceKeySignature,
     );
+    if (!valid) {
+      this.incrementSecurityMetric('handshakeMismatches');
+      this.appendSecurityEvent('handshake_mismatch', {
+        senderDeviceId: handshakeMessage?.senderDeviceId,
+      });
+    }
+    return valid;
   }
 
   maybeRatchetSendChain(session) {
+    const now = Date.now();
+    if (
+      typeof session.lastActivityAt === 'number'
+      && now - session.lastActivityAt > this.longInactivityMs
+    ) {
+      session.ratchetPending = true;
+      session.forceRatchetOnNextSend = true;
+    }
     if (!session.ratchetPending || !session.lastDHKey) {
       return;
     }
 
+    const previousRootKey = Buffer.from(session.rootKey);
+    const previousChainSend = Buffer.from(session.chainKeySend);
+    const previousChainReceive = Buffer.from(session.chainKeyReceive);
     const newDhKeyPair = this.createDhKeyPair();
-    const newSharedSecret = deriveSharedSecret(newDhKeyPair.privateKey, session.lastDHKey);
-    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    let newSharedSecret = null;
+    let next = null;
+    try {
+      newSharedSecret = deriveSharedSecret(newDhKeyPair.privateKey, session.lastDHKey);
+      next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    } finally {
+      secureZero(newSharedSecret);
+    }
 
     session.previousCounter = session.sendCounter;
     session.sendCounter = 0;
@@ -663,6 +944,13 @@ class SecureClient {
     session.rootKey = Buffer.from(next.rootKey);
     session.chainKeySend = Buffer.from(next.chainKey);
     session.ratchetPending = false;
+    session.forceRatchetOnNextSend = false;
+    if (session.skippedMessageKeys instanceof Map) {
+      session.skippedMessageKeys.clear();
+    }
+    secureZero(previousRootKey);
+    secureZero(previousChainSend);
+    secureZero(previousChainReceive);
   }
 
   validateRequiredChatMessageFields(message) {
@@ -680,6 +968,13 @@ class SecureClient {
     routeSecret,
     attachments,
   }) {
+    if (this.safeMode) {
+      this.queueDummyForTrafficSlot();
+      this.appendSecurityEvent('safe_mode_real_send_blocked', {
+        recipientDeviceId,
+      });
+      return null;
+    }
     const session = this.ensureSession({
       peerDeviceId: recipientDeviceId,
       peerIdentityPublicKey: recipientIdentityPublicKey,
@@ -1028,14 +1323,28 @@ class SecureClient {
       return;
     }
 
-    const newSharedSecret = deriveSharedSecret(session.selfDHKeyPair.privateKey, incomingDhPublicKey);
-    const next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    const previousRootKey = Buffer.from(session.rootKey);
+    const previousChainReceive = Buffer.from(session.chainKeyReceive);
+    let newSharedSecret = null;
+    let next = null;
+    try {
+      newSharedSecret = deriveSharedSecret(session.selfDHKeyPair.privateKey, incomingDhPublicKey);
+      next = deriveRootAndChainFromDh(session.rootKey, newSharedSecret);
+    } finally {
+      secureZero(newSharedSecret);
+    }
     session.rootKey = Buffer.from(next.rootKey);
     session.chainKeyReceive = Buffer.from(next.chainKey);
     session.receiveCounter = 0;
     session.currentReceiveDhKey = incomingDhPublicKey;
     session.lastDHKey = incomingDhPublicKey;
     session.ratchetPending = true;
+    session.forceRatchetOnNextSend = true;
+    if (session.skippedMessageKeys instanceof Map) {
+      session.skippedMessageKeys.clear();
+    }
+    secureZero(previousRootKey);
+    secureZero(previousChainReceive);
   }
 
   deriveReceiveMessageKey(session, message) {
@@ -1073,49 +1382,90 @@ class SecureClient {
   decryptChat({ message, senderDevicePublicKey, senderIdentityPublicKey, routeSecret }) {
     const normalizedMessage = validateMessage(message);
     this.validateRequiredChatMessageFields(normalizedMessage);
+    if (this.shouldQuarantineMessages()) {
+      this.quarantineInboundMessage({
+        message: normalizedMessage,
+        senderDevicePublicKey,
+        senderIdentityPublicKey,
+        routeSecret,
+      });
+      return null;
+    }
 
-    // --- Trust enforcement (BEFORE decryption) ----------------------------
-    if (senderIdentityPublicKey) {
-      const trustResult = this.checkAndUpdateTrust(senderIdentityPublicKey, senderDevicePublicKey);
-      if (trustResult === 'BLOCKED') {
+    let messageKey = null;
+    try {
+      if (senderIdentityPublicKey) {
+        const trustResult = this.checkAndUpdateTrust(senderIdentityPublicKey, senderDevicePublicKey);
+        if (trustResult === 'BLOCKED') {
+          this.incrementSecurityMetric('droppedMessages');
+          this.appendSecurityEvent('blocked_message_dropped', {
+            senderDeviceId: normalizedMessage.senderDeviceId,
+            messageId: normalizedMessage.messageId,
+          });
+          return null;
+        }
+      }
+
+      const securityState = this.getCurrentSecurityState();
+      if (
+        securityState.identityIntegrity === IDENTITY_INTEGRITY.CHANGED
+        && securityState.trustLevel === TRUST_LEVELS.VERIFIED
+      ) {
+        throw new Error('Security alert: verified identity changed; refusing message');
+      }
+
+      if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
+        this.incrementSecurityMetric('invalidSignatures');
+        throw new Error('Protocol violation: invalid message signature');
+      }
+
+      const session = this.ensureSession({
+        peerDeviceId: normalizedMessage.senderDeviceId,
+        peerIdentityPublicKey: senderIdentityPublicKey,
+        peerDevicePublicKey: senderDevicePublicKey,
+        routeSecret,
+      });
+
+      this.pruneSeenMessageIds(session.seenMessageIds);
+      if (session.seenMessageIds.has(normalizedMessage.messageId)) {
+        this.incrementSecurityMetric('replayAttempts');
         return null;
       }
+      session.seenMessageIds.set(normalizedMessage.messageId, Date.now() + this.replayTtlMs);
+
+      this.applyReceiveRatchetIfNeeded(session, normalizedMessage.dhPublicKey);
+
+      const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
+      if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
+        this.incrementSecurityMetric('routeTagMismatches');
+        throw new Error('Protocol violation: routeTag mismatch');
+      }
+
+      if (normalizedMessage.counter > session.receiveCounter + Math.max(1, this.receiveWindow / 2)) {
+        this.updateSecurityState({ type: SECURITY_EVENTS.ABNORMAL_COUNTER_GAPS });
+      }
+
+      messageKey = this.deriveReceiveMessageKey(session, normalizedMessage);
+      this.touchSession(session);
+      this.persistSessions();
+
+      const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
+      if (payload?.isDummy) {
+        return null;
+      }
+      this.acknowledgeDelivery(normalizedMessage);
+      return payload;
+    } catch (error) {
+      this.incrementSecurityMetric('messageFailures');
+      this.appendSecurityEvent('protocol_violation', {
+        message: error.message,
+        senderDeviceId: normalizedMessage.senderDeviceId,
+        messageId: normalizedMessage.messageId,
+      });
+      throw error;
+    } finally {
+      secureZero(messageKey);
     }
-
-    if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
-      throw new Error('Protocol violation: invalid message signature');
-    }
-
-    const session = this.ensureSession({
-      peerDeviceId: normalizedMessage.senderDeviceId,
-      peerIdentityPublicKey: senderIdentityPublicKey,
-      peerDevicePublicKey: senderDevicePublicKey,
-      routeSecret,
-    });
-
-    this.pruneSeenMessageIds(session.seenMessageIds);
-    if (session.seenMessageIds.has(normalizedMessage.messageId)) {
-      return null;
-    }
-    session.seenMessageIds.set(normalizedMessage.messageId, Date.now() + this.replayTtlMs);
-
-    this.applyReceiveRatchetIfNeeded(session, normalizedMessage.dhPublicKey);
-
-    const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
-    if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
-      throw new Error('Protocol violation: routeTag mismatch');
-    }
-
-    const messageKey = this.deriveReceiveMessageKey(session, normalizedMessage);
-    this.touchSession(session);
-    this.persistSessions();
-
-    const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
-    if (payload?.isDummy) {
-      return null;
-    }
-    this.acknowledgeDelivery(normalizedMessage);
-    return payload;
   }
 
   delayInboundProcessing(task, { min, max } = this.inboundProcessDelayRangeMs) {
@@ -1138,6 +1488,7 @@ class SecureClient {
 
   handleInboundMessage(params) {
     const normalized = validateMessage(params.message);
+    this.trackInboundTiming();
     if (normalized.type === 'ack') {
       this.receiveAck(normalized);
       return null;
@@ -1149,6 +1500,9 @@ class SecureClient {
   }
 
   pull(routeSecrets = [], { window = this.receiveWindow } = {}) {
+    if (this.safeMode) {
+      return;
+    }
     const boundedWindow = Math.max(0, Math.min(window, this.maxPullWindow));
     const effectiveRouteSecrets = [...new Set([...routeSecrets, ...this.decoyRouteSecrets])];
     const routeTags = [];
@@ -1212,6 +1566,9 @@ class SecureClient {
   }
 
   startAutoPull(routeSecrets = [], { intervalMs = 2_000, window = this.receiveWindow } = {}) {
+    if (this.safeMode) {
+      return;
+    }
     this.ensureDecoySessions();
     this.autoPullActive = true;
     this.autoPullRouteSecrets = [...routeSecrets];
@@ -1279,6 +1636,10 @@ class SecureClient {
           : [],
       };
       this.trustStore.set(fingerprint, entry);
+      this.updateSecurityState({
+        trustLevel: TRUST_LEVELS.UNKNOWN,
+        identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
+      });
       return null;
     }
 
@@ -1288,6 +1649,14 @@ class SecureClient {
     // Check for identity key change (potential MITM): direct PEM comparison
     if (existing.identityPublicKey !== identityPublicKey) {
       updated.lastFingerprintChange = now;
+      this.appendSecurityEvent('identity_change_detected', {
+        fingerprint,
+        previousFingerprint: existing.fingerprint,
+      });
+      this.updateSecurityState({
+        type: SECURITY_EVENTS.IDENTITY_KEY_CHANGE_DETECTED,
+        trustLevel: existing.level,
+      });
 
       if (existing.level === TRUST_LEVELS.VERIFIED) {
         // Hard block – VERIFIED identity cannot silently change key
@@ -1306,6 +1675,12 @@ class SecureClient {
     // Enforce BLOCKED rule – return sentinel so caller can drop silently
     if (updated.level === TRUST_LEVELS.BLOCKED) {
       this.trustStore.set(fingerprint, updated);
+      this.updateSecurityState({
+        trustLevel: TRUST_LEVELS.BLOCKED,
+      });
+      this.appendSecurityEvent('blocked_message_dropped', {
+        fingerprint,
+      });
       return 'BLOCKED';
     }
 
@@ -1321,6 +1696,10 @@ class SecureClient {
     }
 
     this.trustStore.set(fingerprint, updated);
+    this.updateSecurityState({
+      trustLevel: updated.level || TRUST_LEVELS.UNKNOWN,
+      identityIntegrity: updated.level === TRUST_LEVELS.VERIFIED ? IDENTITY_INTEGRITY.OK : IDENTITY_INTEGRITY.UNVERIFIED,
+    });
     return null;
   }
 
@@ -1357,6 +1736,14 @@ class SecureClient {
       lastSeen: now,
       label: label !== undefined ? label : (existing.label || undefined),
     });
+    this.updateSecurityState({
+      trustLevel: TRUST_LEVELS.TRUSTED,
+      identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
+    });
+    this.appendSecurityEvent('trust_changed', {
+      fingerprint,
+      level: TRUST_LEVELS.TRUSTED,
+    });
   }
 
   /**
@@ -1382,6 +1769,14 @@ class SecureClient {
       lastSeen: now,
       verifiedAt: now,
     });
+    this.updateSecurityState({
+      trustLevel: TRUST_LEVELS.VERIFIED,
+      identityIntegrity: IDENTITY_INTEGRITY.OK,
+    });
+    this.appendSecurityEvent('trust_changed', {
+      fingerprint,
+      level: TRUST_LEVELS.VERIFIED,
+    });
   }
 
   /**
@@ -1406,6 +1801,13 @@ class SecureClient {
       level: TRUST_LEVELS.BLOCKED,
       lastSeen: now,
     });
+    this.updateSecurityState({
+      trustLevel: TRUST_LEVELS.BLOCKED,
+    });
+    this.appendSecurityEvent('trust_changed', {
+      fingerprint,
+      level: TRUST_LEVELS.BLOCKED,
+    });
   }
 
   /**
@@ -1424,6 +1826,15 @@ class SecureClient {
       ...existing,
       level: TRUST_LEVELS.UNKNOWN,
       lastSeen: Date.now(),
+    });
+    this.updateSecurityState({
+      type: SECURITY_EVENTS.TRUST_DOWNGRADE,
+      trustLevel: TRUST_LEVELS.UNKNOWN,
+      identityIntegrity: IDENTITY_INTEGRITY.UNVERIFIED,
+    });
+    this.appendSecurityEvent('trust_changed', {
+      fingerprint,
+      level: TRUST_LEVELS.UNKNOWN,
     });
   }
 
