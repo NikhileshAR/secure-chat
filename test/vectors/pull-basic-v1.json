@@ -1,0 +1,24 @@
+{
+  "name": "pull-basic-v1",
+  "input": {
+    "type": "pull",
+    "protocolVersion": "1.0",
+    "senderDeviceId": "bob-device",
+    "timestamp": 1710000002000,
+    "encryptedPayload": "",
+    "routeTags": [
+      "tag-a",
+      "tag-b"
+    ]
+  },
+  "encoded_base64": "eyJlbmNyeXB0ZWRQYXlsb2FkIjoiIiwicHJvdG9jb2xWZXJzaW9uIjoiMS4wIiwicm91dGVUYWdzIjpbInRhZy1hIiwidGFnLWIiXSwic2VuZGVyRGV2aWNlSWQiOiJib2ItZGV2aWNlIiwidGltZXN0YW1wIjoxNzEwMDAwMDAyMDAwLCJ0eXBlIjoicHVsbCJ9",
+  "hash": "5b89d4014cc39121ad59d5524a3fe94323edf3b0ef5d16f00619b6012c2c06d1",
+  "expected_fields": [
+    "type",
+    "protocolVersion",
+    "senderDeviceId",
+    "timestamp",
+    "encryptedPayload",
+    "routeTags"
+  ]
+}

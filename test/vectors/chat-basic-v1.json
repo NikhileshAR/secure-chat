@@ -1,0 +1,33 @@
+{
+  "name": "chat-basic-v1",
+  "input": {
+    "type": "chat",
+    "protocolVersion": "1.0",
+    "messageId": "msg-1",
+    "senderDeviceId": "alice-device",
+    "targetDeviceId": "bob-device",
+    "counter": 0,
+    "previousCounter": 0,
+    "dhPublicKey": "dh-public",
+    "routeTag": "route-tag",
+    "encryptedPayload": "{\"ciphertext\":\"deterministic-test-only\"}",
+    "timestamp": 1710000001000,
+    "signature": "signature"
+  },
+  "encoded_base64": "eyJjb3VudGVyIjowLCJkaFB1YmxpY0tleSI6ImRoLXB1YmxpYyIsImVuY3J5cHRlZFBheWxvYWQiOiJ7XCJjaXBoZXJ0ZXh0XCI6XCJkZXRlcm1pbmlzdGljLXRlc3Qtb25seVwifSIsIm1lc3NhZ2VJZCI6Im1zZy0xIiwicHJldmlvdXNDb3VudGVyIjowLCJwcm90b2NvbFZlcnNpb24iOiIxLjAiLCJyb3V0ZVRhZyI6InJvdXRlLXRhZyIsInNlbmRlckRldmljZUlkIjoiYWxpY2UtZGV2aWNlIiwic2lnbmF0dXJlIjoic2lnbmF0dXJlIiwidGFyZ2V0RGV2aWNlSWQiOiJib2ItZGV2aWNlIiwidGltZXN0YW1wIjoxNzEwMDAwMDAxMDAwLCJ0eXBlIjoiY2hhdCJ9",
+  "hash": "22321f90034eea71dadc96e8c94540b1765bb949ba6980b129bbf93af9c6f5a2",
+  "expected_fields": [
+    "type",
+    "protocolVersion",
+    "messageId",
+    "senderDeviceId",
+    "targetDeviceId",
+    "counter",
+    "previousCounter",
+    "dhPublicKey",
+    "routeTag",
+    "encryptedPayload",
+    "timestamp",
+    "signature"
+  ]
+}

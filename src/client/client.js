@@ -30,6 +30,9 @@ const {
   secureZero,
 } = require('./crypto');
 const { validateMessage, PROTOCOL_VERSION } = require('../protocol/schema');
+const { encodeMessage, decodeMessage } = require('../protocol/wire');
+const { assertInvariant } = require('../protocol/invariants');
+const { SUPPORTED_VERSIONS, negotiateProtocolVersion } = require('../protocol/spec');
 const { SessionStore } = require('./storage/sessionStore');
 const { KeyVault } = require('./storage/keyVault');
 const { TrustStore, TRUST_LEVELS } = require('./storage/trustStore');
@@ -143,6 +146,8 @@ class SecureClient {
     securityThresholds = DEFAULT_SECURITY_THRESHOLDS,
     securityState,
     securityLog,
+    strictWireMode = false,
+    supportedVersions = SUPPORTED_VERSIONS,
   }) {
     this.serverUrl = serverUrl;
     this.identity = identity;
@@ -235,6 +240,11 @@ class SecureClient {
     this.pullNoiseSeed = randomBytes(32).toString('hex');
     this.pullNoiseCounter = 0;
     this.protocolVersion = PROTOCOL_VERSION;
+    this.strictWireMode = Boolean(strictWireMode);
+    this.supportedVersions = Array.isArray(supportedVersions) && supportedVersions.length
+      ? [...new Set(supportedVersions.filter((version) => typeof version === 'string'))]
+      : [...SUPPORTED_VERSIONS];
+    this.peerProtocolVersions = new Map();
     this.pendingAcks = new Map();
     this.ackRetryIntervalMs = Math.max(250, Number(ackRetryIntervalMs) || 2_000);
     this.ackMaxRetries = Math.max(1, Number(ackMaxRetries) || 5);
@@ -323,6 +333,14 @@ class SecureClient {
 
   appendSecurityEvent(type, details = {}) {
     this.securityLog.append(type, details);
+  }
+
+  assertProtocolInvariant(name, condition, details = {}) {
+    return assertInvariant(name, condition, {
+      details,
+      securityLog: this.securityLog,
+      emitSecurityEvent: (eventType, payload) => this.appendSecurityEvent(eventType, payload),
+    });
   }
 
   updateSecurityState(event) {
@@ -627,6 +645,7 @@ class SecureClient {
         classicalDevice: this.identity.deviceKeyPair.publicKey,
         postQuantumDevice: this.postQuantumPublicKey,
       },
+      supportedVersions: this.supportedVersions,
     });
     for (const session of this.sessions.values()) {
       if (session && typeof session === 'object') {
@@ -646,8 +665,8 @@ class SecureClient {
       ...message,
       protocolVersion: this.protocolVersion,
     };
-    validateMessage(withVersion);
-    this.socket.send(`${JSON.stringify(withVersion)}\n`);
+    const encoded = encodeMessage(withVersion, { strictMode: this.strictWireMode });
+    this.socket.send(encoded);
   }
 
   randomInRange({ min, max }) {
@@ -890,9 +909,35 @@ class SecureClient {
       }
       session.skippedMessageKeys.delete(next.value);
     }
+    this.assertProtocolInvariant(
+      'skipped_message_keys_bounded',
+      session.skippedMessageKeys.size <= boundedMax,
+      {
+        size: session.skippedMessageKeys.size,
+        boundedMax,
+      },
+    );
   }
 
   isHandshakeValid(handshakeMessage) {
+    const remoteSupportedVersions = handshakeMessage.supportedVersions
+      || (handshakeMessage.protocolVersion
+        ? [handshakeMessage.protocolVersion]
+        : [this.protocolVersion]);
+    const negotiatedVersion = negotiateProtocolVersion(
+      this.supportedVersions,
+      remoteSupportedVersions,
+    );
+    if (!negotiatedVersion) {
+      this.incrementSecurityMetric('handshakeMismatches');
+      this.appendSecurityEvent('handshake_version_mismatch', {
+        senderDeviceId: handshakeMessage?.senderDeviceId,
+        localSupportedVersions: this.supportedVersions,
+        remoteSupportedVersions,
+      });
+      return false;
+    }
+
     const identityPublicKey = handshakeMessage.identityPublicKey
       || handshakeMessage.publicKeys?.identity;
     const devicePublicKey = handshakeMessage.devicePublicKey
@@ -908,6 +953,9 @@ class SecureClient {
       this.appendSecurityEvent('handshake_mismatch', {
         senderDeviceId: handshakeMessage?.senderDeviceId,
       });
+    }
+    if (valid && handshakeMessage?.senderDeviceId) {
+      this.peerProtocolVersions.set(handshakeMessage.senderDeviceId, negotiatedVersion);
     }
     return valid;
   }
@@ -1348,6 +1396,7 @@ class SecureClient {
   }
 
   deriveReceiveMessageKey(session, message) {
+    const previousReceiveCounter = session.receiveCounter;
     const skippedKeyId = this.makeSkippedKeyId(message.dhPublicKey, message.counter);
     if (session.skippedMessageKeys.has(skippedKeyId)) {
       const messageKey = session.skippedMessageKeys.get(skippedKeyId);
@@ -1376,6 +1425,15 @@ class SecureClient {
     const messageKey = deriveMessageKey(chainKey);
     session.chainKeyReceive = deriveNextChainKey(chainKey);
     session.receiveCounter = message.counter + 1;
+    this.assertProtocolInvariant(
+      'receive_counter_monotonic',
+      session.receiveCounter >= previousReceiveCounter,
+      {
+        previousReceiveCounter,
+        nextReceiveCounter: session.receiveCounter,
+        messageCounter: message.counter,
+      },
+    );
     return messageKey;
   }
 
@@ -1407,14 +1465,25 @@ class SecureClient {
       }
 
       const securityState = this.getCurrentSecurityState();
-      if (
-        securityState.identityIntegrity === IDENTITY_INTEGRITY.CHANGED
-        && securityState.trustLevel === TRUST_LEVELS.VERIFIED
-      ) {
-        throw new Error('Security alert: verified identity changed; refusing message');
-      }
+      this.assertProtocolInvariant(
+        'verified_identity_immutability',
+        !(
+          securityState.identityIntegrity === IDENTITY_INTEGRITY.CHANGED
+          && securityState.trustLevel === TRUST_LEVELS.VERIFIED
+        ),
+        {
+          senderDeviceId: normalizedMessage.senderDeviceId,
+          trustLevel: securityState.trustLevel,
+          identityIntegrity: securityState.identityIntegrity,
+        },
+      );
 
-      if (!verifyMessage(senderIdentityPublicKey, normalizedMessage, normalizedMessage.signature)) {
+      const signatureVerified = verifyMessage(
+        senderIdentityPublicKey,
+        normalizedMessage,
+        normalizedMessage.signature,
+      );
+      if (!signatureVerified) {
         this.incrementSecurityMetric('invalidSignatures');
         throw new Error('Protocol violation: invalid message signature');
       }
@@ -1436,10 +1505,18 @@ class SecureClient {
       this.applyReceiveRatchetIfNeeded(session, normalizedMessage.dhPublicKey);
 
       const expectedRouteTags = this.computeRouteTagCandidates(session.rootKey, normalizedMessage.counter, 'send');
-      if (!expectedRouteTags.includes(normalizedMessage.routeTag)) {
+      const routeTagMatches = expectedRouteTags.includes(normalizedMessage.routeTag);
+      if (!routeTagMatches) {
         this.incrementSecurityMetric('routeTagMismatches');
-        throw new Error('Protocol violation: routeTag mismatch');
       }
+      this.assertProtocolInvariant(
+        'route_tag_derived_match',
+        routeTagMatches,
+        {
+          senderDeviceId: normalizedMessage.senderDeviceId,
+          counter: normalizedMessage.counter,
+        },
+      );
 
       if (normalizedMessage.counter > session.receiveCounter + Math.max(1, this.receiveWindow / 2)) {
         this.updateSecurityState({ type: SECURITY_EVENTS.ABNORMAL_COUNTER_GAPS });
@@ -1449,6 +1526,14 @@ class SecureClient {
       this.touchSession(session);
       this.persistSessions();
 
+      this.assertProtocolInvariant(
+        'signature_verified_before_decrypt',
+        signatureVerified === true,
+        {
+          senderDeviceId: normalizedMessage.senderDeviceId,
+          messageId: normalizedMessage.messageId,
+        },
+      );
       const payload = decryptPayloadWithMessageKey(JSON.parse(normalizedMessage.encryptedPayload), messageKey);
       if (payload?.isDummy) {
         return null;
@@ -1487,7 +1572,15 @@ class SecureClient {
   }
 
   handleInboundMessage(params) {
-    const normalized = validateMessage(params.message);
+    const inboundMessage = params?.message;
+    const normalized = typeof inboundMessage === 'string'
+      || Buffer.isBuffer(inboundMessage)
+      || inboundMessage instanceof Uint8Array
+      ? decodeMessage(inboundMessage, { strictMode: this.strictWireMode })
+      : decodeMessage(
+        encodeMessage(inboundMessage, { strictMode: this.strictWireMode }),
+        { strictMode: this.strictWireMode },
+      );
     this.trackInboundTiming();
     if (normalized.type === 'ack') {
       this.receiveAck(normalized);
