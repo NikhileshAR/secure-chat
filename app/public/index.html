@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Secure Chat Demo App</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <h1>Secure Chat Demo</h1>
+
+    <section>
+      <h2>Connection</h2>
+      <div class="row">
+        <input id="relayUrl" placeholder="ws://relay-host:8080" />
+        <button id="connectBtn">Connect</button>
+      </div>
+      <div class="row">
+        <input id="configFile" type="file" accept="application/json" />
+      </div>
+      <p id="connectionStatus">Status: DISCONNECTED</p>
+    </section>
+
+    <section>
+      <h2>Identity</h2>
+      <p><strong>Fingerprint:</strong> <span id="fingerprint"></span></p>
+      <button id="shareIdentityBtn">Share Identity</button>
+      <div id="sharePanel" class="hidden">
+        <img id="shareQr" alt="Identity QR" />
+        <textarea id="shareText" readonly></textarea>
+        <button id="copyIdentityBtn">Copy Identity Text</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Contacts</h2>
+      <div class="row">
+        <input id="contactLabel" placeholder="Contact label (optional)" />
+      </div>
+      <textarea id="contactPayload" placeholder="Paste identity payload JSON"></textarea>
+      <div class="row">
+        <input id="qrImageFile" type="file" accept="image/*" />
+        <button id="decodeQrBtn">Scan QR Image</button>
+        <button id="addContactBtn">Add Contact</button>
+      </div>
+      <p id="scanStatus"></p>
+      <ul id="contactsList"></ul>
+    </section>
+
+    <section>
+      <h2>Chat</h2>
+      <div class="row">
+        <select id="chatContactSelect"></select>
+      </div>
+      <div id="chatMessages" class="messages"></div>
+      <div class="row">
+        <input id="chatInput" placeholder="Type a message" />
+        <button id="sendBtn">Send</button>
+      </div>
+    </section>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

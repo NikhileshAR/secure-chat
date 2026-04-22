@@ -16,14 +16,27 @@ function parseArgs(argv = process.argv.slice(2)) {
   return args;
 }
 
-function generateClientBundle({ relayUrl, relayId, outDir = path.resolve(process.cwd(), 'bundle') }) {
-  if (!relayUrl) {
-    throw new Error('relayUrl is required');
+function uniqueUrls(urls = []) {
+  return [...new Set(urls.map((url) => String(url || '').trim()).filter(Boolean))];
+}
+
+function generateClientBundle({
+  relayUrl,
+  publicUrl,
+  relayUrls = [],
+  relayId,
+  outDir = path.resolve(process.cwd(), 'bundle'),
+}) {
+  const mergedRelayUrls = uniqueUrls([publicUrl, relayUrl, ...relayUrls]);
+  if (!mergedRelayUrls.length) {
+    throw new Error('At least one relay URL is required');
   }
 
   fs.mkdirSync(outDir, { recursive: true });
   const config = {
-    relayUrl,
+    relayUrl: mergedRelayUrls[0],
+    publicUrl: publicUrl ? String(publicUrl).trim() : undefined,
+    relayUrls: mergedRelayUrls,
     relayId: relayId || 'unknown',
     securityDefaults: {
       opsecMode: 'HARDENED',
@@ -36,6 +49,8 @@ function generateClientBundle({ relayUrl, relayId, outDir = path.resolve(process
   fs.writeFileSync(path.join(outDir, 'connect-instructions.txt'), [
     'Secure Chat Relay Connection',
     `Relay URL: ${config.relayUrl}`,
+    ...(config.publicUrl ? [`Public URL: ${config.publicUrl}`] : []),
+    `Relay failover URLs: ${config.relayUrls.join(', ')}`,
     `Relay ID: ${config.relayId}`,
     'Import client-config.json in your client and keep OPSEC mode set to HARDENED.',
   ].join('\n'), 'utf8');
@@ -47,6 +62,8 @@ if (require.main === module) {
   const args = parseArgs();
   const config = generateClientBundle({
     relayUrl: args.relayUrl,
+    publicUrl: args.publicUrl,
+    relayUrls: args.relayUrls ? args.relayUrls.split(',').map((value) => value.trim()).filter(Boolean) : [],
     relayId: args.relayId,
     outDir: args.outDir && path.resolve(args.outDir),
   });
@@ -57,4 +74,5 @@ if (require.main === module) {
 module.exports = {
   generateClientBundle,
   parseArgs,
+  uniqueUrls,
 };

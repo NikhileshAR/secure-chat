@@ -58,8 +58,25 @@ test('client bundle generation outputs required fields and files', () => {
   assert.equal(fs.existsSync(instructionsPath), true);
   assert.equal(fs.existsSync(qrPath), true);
   assert.equal(config.relayUrl, 'ws://127.0.0.1:8080');
+  assert.deepEqual(config.relayUrls, ['ws://127.0.0.1:8080']);
   assert.equal(config.relayId, 'relay-123');
   assert.equal(config.securityDefaults.strictWireMode, true);
+
+  fs.rmSync(outDir, { recursive: true, force: true });
+});
+
+test('client bundle prefers publicUrl when provided', () => {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'securechat-public-bundle-'));
+  const config = generateClientBundle({
+    relayUrl: 'ws://127.0.0.1:8080',
+    publicUrl: 'ws://relay.example.com:8080',
+    relayId: 'relay-public',
+    outDir,
+  });
+
+  assert.equal(config.relayUrl, 'ws://relay.example.com:8080');
+  assert.deepEqual(config.relayUrls, ['ws://relay.example.com:8080', 'ws://127.0.0.1:8080']);
+  assert.equal(config.publicUrl, 'ws://relay.example.com:8080');
 
   fs.rmSync(outDir, { recursive: true, force: true });
 });

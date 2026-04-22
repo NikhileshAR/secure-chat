@@ -20,6 +20,16 @@ npm install
 npm run start:server
 ```
 
+## Run minimal demo client app
+
+```bash
+npm install
+npm run start:app
+```
+
+Then open `http://127.0.0.1:8787`.
+Use the connection screen to import `client-config.json` or enter a relay URL.
+
 Config via env vars:
 
 - `SECURE_RELAY_HOST` (default `0.0.0.0`, falls back to `SEKURE_RELAY_HOST`)
@@ -31,3 +41,9 @@ Config via env vars:
 ```bash
 npm test
 ```
+
+## Deployment docs
+
+- `docs/self-hosting.md`
+- `docs/public-relay.md`
+- `docs/demo-flow.md`
