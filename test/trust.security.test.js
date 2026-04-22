@@ -102,7 +102,7 @@ test('verifyIdentity sets level to VERIFIED with timestamp', () => {
     const peer = generateIdentity();
     const peerKey = peer.identityKeyPair.publicKey;
 
-    client.verifyIdentity(peerKey);
+    client.verifyIdentity(peerKey, { confirmed: true });
 
     assert.equal(client.getTrustLevel(peerKey), TRUST_LEVELS.VERIFIED);
 
@@ -125,7 +125,7 @@ test('VERIFIED identity key change throws hard error', () => {
     const peerAKey = peerA.identityKeyPair.publicKey;
 
     // Mark peerA's key as VERIFIED under peerA's fingerprint slot
-    client.verifyIdentity(peerAKey);
+    client.verifyIdentity(peerAKey, { confirmed: true });
     assert.equal(client.getTrustLevel(peerAKey), TRUST_LEVELS.VERIFIED);
 
     // Generate a genuinely different identity (different key material)
@@ -337,7 +337,7 @@ test('listTrustedIdentities filters by TRUSTED and VERIFIED levels', () => {
     const idC = generateIdentity();
 
     client.trustIdentity(idA.identityKeyPair.publicKey);
-    client.verifyIdentity(idB.identityKeyPair.publicKey);
+    client.verifyIdentity(idB.identityKeyPair.publicKey, { confirmed: true });
     client.checkAndUpdateTrust(idC.identityKeyPair.publicKey); // UNKNOWN
 
     const trusted = client.listTrustedIdentities();
@@ -364,7 +364,7 @@ test('unblockIdentity reverts a BLOCKED identity back to UNKNOWN', () => {
     client.blockIdentity(peerKey);
     assert.equal(client.getTrustLevel(peerKey), TRUST_LEVELS.BLOCKED);
 
-    client.unblockIdentity(peerKey);
+    client.unblockIdentity(peerKey, { confirmed: true });
     assert.equal(client.getTrustLevel(peerKey), TRUST_LEVELS.UNKNOWN);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

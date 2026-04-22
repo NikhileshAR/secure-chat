@@ -44,6 +44,12 @@ const {
   ENVIRONMENT_RISK,
 } = require('./securityState');
 const { SecurityLog } = require('./securityLog');
+const { validateConfig } = require('./configGuard');
+const {
+  getEnvironmentRisk,
+  observeMessageProcessingDuration,
+  evaluateEnvironmentSignals,
+} = require('./environment');
 
 const REQUIRED_CHAT_FIELDS = [
   'type',
@@ -103,6 +109,17 @@ function shuffleInPlace(values) {
   return output;
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  if (!value || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+}
+
 class SecureClient {
   constructor({
     serverUrl,
@@ -146,9 +163,42 @@ class SecureClient {
     securityThresholds = DEFAULT_SECURITY_THRESHOLDS,
     securityState,
     securityLog,
-    strictWireMode = false,
+    securityProfile,
+    productionMode,
+    environmentRiskEvaluator = getEnvironmentRisk,
+    strictWireMode,
     supportedVersions = SUPPORTED_VERSIONS,
   }) {
+    const rawConfig = {
+      mode: process.env.NODE_ENV,
+      productionMode,
+      securityProfile,
+      strictWireMode,
+      constantTrafficEnabled,
+      paddingSizeBuckets,
+      pullNoiseLevel,
+      rateShaping,
+    };
+    const effectiveSecurityLog = securityLog || new SecurityLog();
+    const {
+      safeConfig,
+      warnings: configWarnings,
+      criticalViolations,
+    } = validateConfig(rawConfig);
+    const shouldFailClosed = safeConfig.securityProfile !== 'DEV';
+    for (const warning of configWarnings) {
+      effectiveSecurityLog.append('config_warning', { warning });
+    }
+    if (criticalViolations.length && shouldFailClosed) {
+      throw new Error(`Unsafe client configuration: ${criticalViolations.join('; ')}`);
+    }
+
+    const effectivePaddingSizeBuckets = safeConfig.paddingSizeBuckets || paddingSizeBuckets;
+    const effectivePullNoiseLevel = safeConfig.pullNoiseLevel;
+    const effectiveConstantTrafficEnabled = safeConfig.constantTrafficEnabled;
+    const effectiveRateShaping = safeConfig.rateShaping || rateShaping;
+    const effectiveStrictWireMode = safeConfig.strictWireMode;
+
     this.serverUrl = serverUrl;
     this.identity = identity;
     this.postQuantumPublicKey = postQuantumPublicKey || randomBytes(32).toString('base64');
@@ -162,7 +212,9 @@ class SecureClient {
     this.sessionTtlMs = sessionTtlMs;
     this.sessions = new Map();
     this.knownPeerIdentities = new Map();
-    this.paddingSizeBuckets = normalizePaddingBuckets(paddingSizeBuckets);
+    this.securityProfile = safeConfig.securityProfile;
+    this.productionMode = safeConfig.productionMode;
+    this.paddingSizeBuckets = normalizePaddingBuckets(effectivePaddingSizeBuckets);
     this.coverTrafficIntervalRangeMs = normalizeRange(
       coverTrafficIntervalRangeMs,
       DEFAULT_COVER_TRAFFIC_RANGE_MS,
@@ -172,9 +224,9 @@ class SecureClient {
       ? Number(batchingWindowMs)
       : DEFAULT_BATCHING_WINDOW_MS);
     this.parallelRouteTags = Math.max(1, Number(parallelRouteTags) || DEFAULT_PARALLEL_ROUTE_TAGS);
-    this.pullNoiseLevel = Math.max(0, Number(pullNoiseLevel) || 0);
+    this.pullNoiseLevel = Math.max(0, Number(effectivePullNoiseLevel) || 0);
     this.pullIntervalJitterMs = Math.max(0, Number(pullIntervalJitterMs) || 0);
-    this.constantTrafficEnabled = Boolean(constantTrafficEnabled);
+    this.constantTrafficEnabled = Boolean(effectiveConstantTrafficEnabled);
     this.constantTrafficRatePerSecond = Math.max(
       0.1,
       Number(constantTrafficRatePerSecond) || DEFAULT_CONSTANT_TRAFFIC_RATE_PER_SECOND,
@@ -209,8 +261,8 @@ class SecureClient {
     );
     this.decoySessionCount = Math.max(0, Number(decoySessionCount) || 0);
 
-    const minMessagesPerSecond = Number(rateShaping?.minMessagesPerSecond);
-    const maxMessagesPerSecond = Number(rateShaping?.maxMessagesPerSecond);
+    const minMessagesPerSecond = Number(effectiveRateShaping?.minMessagesPerSecond);
+    const maxMessagesPerSecond = Number(effectiveRateShaping?.maxMessagesPerSecond);
     const boundedMin = Number.isFinite(minMessagesPerSecond) && minMessagesPerSecond > 0
       ? minMessagesPerSecond
       : DEFAULT_RATE_SHAPING.minMessagesPerSecond;
@@ -240,7 +292,7 @@ class SecureClient {
     this.pullNoiseSeed = randomBytes(32).toString('hex');
     this.pullNoiseCounter = 0;
     this.protocolVersion = PROTOCOL_VERSION;
-    this.strictWireMode = Boolean(strictWireMode);
+    this.strictWireMode = Boolean(effectiveStrictWireMode);
     this.supportedVersions = Array.isArray(supportedVersions) && supportedVersions.length
       ? [...new Set(supportedVersions.filter((version) => typeof version === 'string'))]
       : [...SUPPORTED_VERSIONS];
@@ -257,9 +309,11 @@ class SecureClient {
     };
     this.safeMode = false;
     this.manualResumeRequired = false;
+    this.environmentRiskEvaluator = environmentRiskEvaluator;
     this.quarantineQueue = [];
+    this.operationalWarnings = [];
     this.securityState = securityState || new SecurityStateEngine();
-    this.securityLog = securityLog || new SecurityLog();
+    this.securityLog = effectiveSecurityLog;
     this.securityMetrics = {
       handshakeMismatches: 0,
       routeTagMismatches: 0,
@@ -292,6 +346,7 @@ class SecureClient {
     if (this.trustStore) {
       this.trustStore.loadTrust();
     }
+    this.evaluateEnvironmentRisk();
     this.securityState.subscribe((state) => {
       if (!this.safeMode && state.sessionHealth === SESSION_HEALTH.HEALTHY) {
         this.retryQuarantinedMessages();
@@ -345,10 +400,18 @@ class SecureClient {
 
   updateSecurityState(event) {
     const state = this.securityState.updateState(event);
+    const eventType = typeof event === 'string' ? event : event?.type;
+    if (eventType === SECURITY_EVENTS.TRUST_DOWNGRADE) {
+      this.registerOperationalWarning('trust_downgrade', 'warning');
+    }
+    if (eventType === SECURITY_EVENTS.ABNORMAL_TIMING_BURST) {
+      this.registerOperationalWarning('abnormal_timing', 'warning');
+    }
     this.appendSecurityEvent('security_state_update', {
-      event: typeof event === 'string' ? event : event?.type,
+      event: eventType,
       state,
     });
+    this.evaluateSafetyEscalation();
     return state;
   }
 
@@ -363,26 +426,103 @@ class SecureClient {
   getSecuritySummary({ identityPublicKey } = {}) {
     const state = this.getCurrentSecurityState();
     const warnings = [];
+    const reasons = [];
+    const recommendations = [];
     if (this.safeMode) {
       warnings.push('SAFE_MODE_ACTIVE');
+      reasons.push('SAFE mode is active');
+      recommendations.push('Review warnings and manually resume only after verification');
     }
     if (state.identityIntegrity === IDENTITY_INTEGRITY.CHANGED) {
       warnings.push('IDENTITY_CHANGED');
+      reasons.push('Identity fingerprint changed');
+      recommendations.push('Re-verify peer identity out-of-band');
     }
     if (state.sessionHealth === SESSION_HEALTH.SUSPECT) {
       warnings.push('SESSION_SUSPECT');
+      reasons.push('Session health is suspect');
+      recommendations.push('Pause sensitive actions until state stabilizes');
     }
     if (state.environmentRisk !== ENVIRONMENT_RISK.LOW) {
       warnings.push(`ENVIRONMENT_RISK_${state.environmentRisk}`);
+      reasons.push(`${state.environmentRisk} environment risk detected`);
+      recommendations.push('Reduce debugging/instrumentation and check host integrity');
     }
     if (this.quarantineQueue.length) {
       warnings.push('QUARANTINED_MESSAGES_PENDING');
+      reasons.push('Quarantined messages pending');
+      recommendations.push('Review quarantined traffic and clear anomalies');
     }
+    if (!this.constantTrafficEnabled) {
+      reasons.push('Constant traffic disabled');
+      recommendations.push('Enable constant traffic to reduce traffic analysis exposure');
+    }
+    if (state.identityIntegrity === IDENTITY_INTEGRITY.UNVERIFIED) {
+      reasons.push('Unverified identity in active session');
+      recommendations.push('Verify identity before sensitive communication');
+    }
+    const overallSafety = this.safeMode
+      || state.environmentRisk === ENVIRONMENT_RISK.HIGH
+      || state.identityIntegrity === IDENTITY_INTEGRITY.CHANGED
+      ? 'DANGER'
+      : (warnings.length ? 'WARNING' : 'SAFE');
     return {
       trustLevel: identityPublicKey ? (this.getTrustLevel(identityPublicKey) || state.trustLevel) : state.trustLevel,
       fingerprintStatus: state.identityIntegrity,
       warnings,
+      overallSafety,
+      reasons: [...new Set(reasons)],
+      recommendations: [...new Set(recommendations)],
     };
+  }
+
+  registerOperationalWarning(reason, severity = 'warning') {
+    const warning = {
+      reason: String(reason || 'unknown_warning'),
+      severity,
+      at: Date.now(),
+    };
+    this.operationalWarnings.push(warning);
+    if (this.operationalWarnings.length > 128) {
+      this.operationalWarnings.splice(0, this.operationalWarnings.length - 128);
+    }
+    this.appendSecurityEvent('operational_warning', warning);
+  }
+
+  evaluateSafetyEscalation() {
+    const state = this.getCurrentSecurityState();
+    const recentWarnings = this.operationalWarnings.filter((warning) => Date.now() - warning.at < 5 * 60_000);
+    const reasons = new Set(recentWarnings.map((warning) => warning.reason));
+    const hasSignatureFailures = reasons.has('signature_failures');
+    const hasTrustDowngrade = reasons.has('trust_downgrade');
+    const hasTimingAnomaly = reasons.has('abnormal_timing');
+    const shouldEscalate = (
+      (state.environmentRisk === ENVIRONMENT_RISK.HIGH && hasSignatureFailures)
+      || (hasTrustDowngrade && hasTimingAnomaly)
+      || (this.securityProfile === 'MAX' && (hasSignatureFailures || hasTrustDowngrade || hasTimingAnomaly))
+    );
+    if (shouldEscalate) {
+      this.enterSafeMode('auto_escalation');
+    }
+  }
+
+  evaluateEnvironmentRisk() {
+    const risk = this.environmentRiskEvaluator();
+    if (risk === ENVIRONMENT_RISK.HIGH) {
+      const reasons = evaluateEnvironmentSignals();
+      this.updateSecurityState({ environmentRisk: ENVIRONMENT_RISK.HIGH });
+      this.registerOperationalWarning('environment_high_risk', 'high');
+      this.appendSecurityEvent('environment_risk_high', { reasons });
+      if (this.securityProfile === 'MAX' || this.securityProfile === 'BALANCED') {
+        this.enterSafeMode('environment_high_risk');
+      }
+    } else if (risk === ENVIRONMENT_RISK.MEDIUM) {
+      this.updateSecurityState({ environmentRisk: ENVIRONMENT_RISK.MEDIUM });
+      this.registerOperationalWarning('environment_medium_risk', 'warning');
+    } else {
+      this.updateSecurityState({ environmentRisk: ENVIRONMENT_RISK.LOW });
+    }
+    return risk;
   }
 
   trackInboundTiming() {
@@ -434,6 +574,7 @@ class SecureClient {
       metricName === 'invalidSignatures'
       && this.securityMetrics.invalidSignatures >= thresholds.invalidSignatures
     ) {
+      this.registerOperationalWarning('signature_failures', 'high');
       this.updateSecurityState({ type: SECURITY_EVENTS.INVALID_SIGNATURE_SPIKE });
       this.enterSafeMode('invalid_signature_spike');
       return;
@@ -453,6 +594,7 @@ class SecureClient {
     if (metricName === 'messageFailures' && this.securityMetrics.messageFailures >= 5) {
       this.updateSecurityState({ type: SECURITY_EVENTS.REPEATED_MESSAGE_FAILURES });
     }
+    this.evaluateSafetyEscalation();
   }
 
   enterSafeMode(reason) {
@@ -1572,6 +1714,7 @@ class SecureClient {
   }
 
   handleInboundMessage(params) {
+    const startedAt = process.hrtime.bigint();
     const inboundMessage = params?.message;
     const normalized = typeof inboundMessage === 'string'
       || Buffer.isBuffer(inboundMessage)
@@ -1581,6 +1724,8 @@ class SecureClient {
         encodeMessage(inboundMessage, { strictMode: this.strictWireMode }),
         { strictMode: this.strictWireMode },
       );
+    observeMessageProcessingDuration(Number(process.hrtime.bigint() - startedAt) / 1e6);
+    this.evaluateEnvironmentRisk();
     this.trackInboundTiming();
     if (normalized.type === 'ack') {
       this.receiveAck(normalized);
@@ -1842,7 +1987,13 @@ class SecureClient {
   /**
    * Mark an identity as VERIFIED (safety-number / out-of-band confirmation).
    */
-  verifyIdentity(identityPublicKey) {
+  verifyIdentity(identityPublicKey, confirmation = {}) {
+    this.confirmSensitiveAction({
+      action: 'verifyIdentity',
+      fingerprint: fingerprintIdentityPublicKey(identityPublicKey),
+      verificationString: this.generateVerificationString(identityPublicKey).numeric,
+      confirmed: confirmation.confirmed,
+    });
     if (!this.trustStore) {
       throw new Error('TrustStore is not configured');
     }
@@ -1906,7 +2057,13 @@ class SecureClient {
   /**
    * Remove a block, reverting the identity to UNKNOWN.
    */
-  unblockIdentity(identityPublicKey) {
+  unblockIdentity(identityPublicKey, confirmation = {}) {
+    this.confirmSensitiveAction({
+      action: 'unblockIdentity',
+      fingerprint: fingerprintIdentityPublicKey(identityPublicKey),
+      verificationString: this.generateVerificationString(identityPublicKey).numeric,
+      confirmed: confirmation.confirmed,
+    });
     if (!this.trustStore) {
       throw new Error('TrustStore is not configured');
     }
@@ -1929,6 +2086,8 @@ class SecureClient {
       fingerprint,
       level: TRUST_LEVELS.UNKNOWN,
     });
+    this.registerOperationalWarning('trust_downgrade', 'warning');
+    this.evaluateSafetyEscalation();
   }
 
   /**
@@ -1983,6 +2142,79 @@ class SecureClient {
       this.identity.identityKeyPair.publicKey,
       peerIdentityPublicKey,
     );
+  }
+
+  confirmSensitiveAction({
+    action,
+    fingerprint,
+    verificationString,
+    confirmed = false,
+  } = {}) {
+    this.appendSecurityEvent('sensitive_action_confirmation_required', {
+      action,
+      fingerprint,
+      verificationString,
+    });
+    if (confirmed !== true) {
+      throw new Error(`Sensitive action "${action}" rejected: confirmation required`);
+    }
+    this.appendSecurityEvent('sensitive_action_confirmed', {
+      action,
+      fingerprint,
+      verificationString,
+    });
+    return true;
+  }
+
+  setStrictWireMode(enabled, confirmation = {}) {
+    if (!enabled) {
+      this.confirmSensitiveAction({
+        action: 'disableStrictWireMode',
+        fingerprint: this.getConfigFingerprint(),
+        verificationString: this.identity.deviceId,
+        confirmed: confirmation.confirmed,
+      });
+    }
+    this.strictWireMode = Boolean(enabled);
+    return this.strictWireMode;
+  }
+
+  exportSecurityLog(filePath, passphrase, confirmation = {}) {
+    this.confirmSensitiveAction({
+      action: 'exportSecurityLog',
+      fingerprint: this.getConfigFingerprint(),
+      verificationString: this.identity.deviceId,
+      confirmed: confirmation.confirmed,
+    });
+    this.securityLog.persistEncrypted(filePath, passphrase);
+  }
+
+  exportPrivateKeys(passphrase, confirmation = {}) {
+    this.confirmSensitiveAction({
+      action: 'exportPrivateKeys',
+      fingerprint: this.getConfigFingerprint(),
+      verificationString: this.identity.deviceId,
+      confirmed: confirmation.confirmed,
+    });
+    return this.unlockPrivateKeys(passphrase);
+  }
+
+  getConfigFingerprint() {
+    const configSnapshot = {
+      securityProfile: this.securityProfile,
+      productionMode: this.productionMode,
+      strictWireMode: this.strictWireMode,
+      constantTrafficEnabled: this.constantTrafficEnabled,
+      constantTrafficRatePerSecond: this.constantTrafficRatePerSecond,
+      pullNoiseLevel: this.pullNoiseLevel,
+      paddingSizeBuckets: this.paddingSizeBuckets,
+      rateShaping: this.rateShaping,
+      parallelRouteTags: this.parallelRouteTags,
+      routeTagEpochMessages: this.routeTagEpochMessages,
+    };
+    return createHash('sha256')
+      .update(stableStringify(configSnapshot))
+      .digest('hex');
   }
 
   close() {
