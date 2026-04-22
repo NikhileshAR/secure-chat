@@ -14,7 +14,20 @@ function openSocket(url) {
 
 function onceMessage(socket) {
   return new Promise((resolve) => {
-    socket.once('message', (data) => resolve(data.toString()));
+    const listener = (data) => {
+      const raw = data.toString();
+      try {
+        const parsed = JSON.parse(raw.trim());
+        if (parsed?.type === 'handshake' && parsed?.senderDeviceId === 'relay') {
+          return;
+        }
+      } catch {
+        // ignore parse errors and resolve raw payload
+      }
+      socket.off('message', listener);
+      resolve(raw);
+    };
+    socket.on('message', listener);
   });
 }
 
@@ -22,7 +35,16 @@ function collectMessages(socket, expectedCount) {
   return new Promise((resolve) => {
     const messages = [];
     const listener = (data) => {
-      messages.push(data.toString());
+      const raw = data.toString();
+      try {
+        const parsed = JSON.parse(raw.trim());
+        if (parsed?.type === 'handshake' && parsed?.senderDeviceId === 'relay') {
+          return;
+        }
+      } catch {
+        // ignore parse errors and keep raw payload
+      }
+      messages.push(raw);
       if (messages.length >= expectedCount) {
         socket.off('message', listener);
         resolve(messages);
@@ -163,65 +185,67 @@ test('relay delivers padded envelopes in shuffled/batched responses without decr
   server.start();
 
   const sender = await openSocket(`ws://127.0.0.1:${port}`);
-  sender.send(`${JSON.stringify({
-    type: 'handshake',
-    senderDeviceId: 'sender-batch',
-    encryptedPayload: '',
-    timestamp: Date.now(),
-  })}\n`);
-
-  const routeTag = computeRouteTag('shared-route-secret', 0);
-  for (let i = 0; i < 3; i += 1) {
-    sender.send(`${JSON.stringify({
-      type: 'chat',
-      senderDeviceId: 'sender-batch',
-      routeTag,
-      messageId: `message-${i}`,
-      counter: i,
-      encryptedPayload: JSON.stringify({
-        encryptedPayload: {
-          iv: 'AAAAAAAAAAAAAAAA',
-          ciphertext: Buffer.alloc(256, i).toString('base64'),
-          tag: 'AAAAAAAAAAAAAAAAAAAAAA==',
-        },
-      }),
-      timestamp: Date.now(),
-      signature: 'sig',
-    })}\n`);
-  }
-
   const receiver = await openSocket(`ws://127.0.0.1:${port}`);
-  receiver.send(`${JSON.stringify({
-    type: 'handshake',
-    senderDeviceId: 'receiver-batch',
-    encryptedPayload: '',
-    timestamp: Date.now(),
-  })}\n`);
+  try {
+    sender.send(`${JSON.stringify({
+      type: 'handshake',
+      senderDeviceId: 'sender-batch',
+      encryptedPayload: '',
+      timestamp: Date.now(),
+    })}\n`);
 
-  const responseWait = collectMessages(receiver, 2);
-  receiver.send(`${JSON.stringify({
-    type: 'control',
-    action: 'pull',
-    senderDeviceId: 'receiver-batch',
-    routeTags: [routeTag],
-    encryptedPayload: '',
-    timestamp: Date.now(),
-  })}\n`);
+    const routeTag = computeRouteTag('shared-route-secret', 0);
+    for (let i = 0; i < 3; i += 1) {
+      sender.send(`${JSON.stringify({
+        type: 'chat',
+        senderDeviceId: 'sender-batch',
+        routeTag,
+        messageId: `message-${i}`,
+        counter: i,
+        encryptedPayload: JSON.stringify({
+          encryptedPayload: {
+            iv: 'AAAAAAAAAAAAAAAA',
+            ciphertext: Buffer.alloc(256, i).toString('base64'),
+            tag: 'AAAAAAAAAAAAAAAAAAAAAA==',
+          },
+        }),
+        timestamp: Date.now(),
+        signature: 'sig',
+      })}\n`);
+    }
 
-  const responseMessages = await responseWait;
-  const decoded = responseMessages.map((raw) => JSON.parse(raw.trim()));
-  const payloads = decoded.map((message) => JSON.parse(message.encryptedPayload));
-  const delivered = payloads.flatMap((payload) => payload.messages);
+    receiver.send(`${JSON.stringify({
+      type: 'handshake',
+      senderDeviceId: 'receiver-batch',
+      encryptedPayload: '',
+      timestamp: Date.now(),
+    })}\n`);
 
-  assert.equal(decoded.every((message) => message.action === 'deliver'), true);
-  assert.equal(payloads[0].messages.length, 2);
-  assert.equal(payloads[1].messages.length, 1);
-  assert.equal(delivered.length, 3);
-  assert.equal(delivered.every((message) => typeof message.encryptedPayload === 'string'), true);
+    const responseWait = collectMessages(receiver, 2);
+    receiver.send(`${JSON.stringify({
+      type: 'control',
+      action: 'pull',
+      senderDeviceId: 'receiver-batch',
+      routeTags: [routeTag],
+      encryptedPayload: '',
+      timestamp: Date.now(),
+    })}\n`);
 
-  sender.close();
-  receiver.close();
-  server.stop();
+    const responseMessages = await responseWait;
+    const decoded = responseMessages.map((raw) => JSON.parse(raw.trim()));
+    const payloads = decoded.map((message) => JSON.parse(message.encryptedPayload));
+    const delivered = payloads.flatMap((payload) => payload.messages);
+    const batchSizes = payloads.map((payload) => payload.messages.length).sort((a, b) => a - b);
+
+    assert.equal(decoded.every((message) => message.action === 'deliver'), true);
+    assert.deepEqual(batchSizes, [1, 2]);
+    assert.equal(delivered.length, 3);
+    assert.equal(delivered.every((message) => typeof message.encryptedPayload === 'string'), true);
+  } finally {
+    sender.close();
+    receiver.close();
+    server.stop();
+  }
 });
 
 test('relay remains stable under burst flood with bounded storage', async () => {
