@@ -62,6 +62,54 @@ function deriveKeyFromStoredKdf(passphrase, kdf) {
   return pbkdf2Sync(String(passphrase || ''), salt, kdf.iterations || PBKDF2_ITERATIONS, 32, 'sha256');
 }
 
+function encryptBlobWithPassphrase(value, passphrase, options = {}) {
+  const salt = randomBytes(16);
+  const { key, kdf } = deriveKey(passphrase, salt, options);
+  const iv = randomBytes(12);
+  const plaintext = Buffer.from(JSON.stringify(value));
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const mac = createHmac('sha256', key)
+    .update(iv)
+    .update(tag)
+    .update(ciphertext)
+    .digest('base64');
+
+  return {
+    schemaVersion: KEY_VAULT_SCHEMA_VERSION,
+    kdf,
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    mac,
+    updatedAt: Date.now(),
+  };
+}
+
+function decryptBlobWithPassphrase(blob, passphrase) {
+  if (!blob || blob.schemaVersion !== KEY_VAULT_SCHEMA_VERSION) {
+    throw new Error('KeyVault unsupported schema version');
+  }
+  const key = deriveKeyFromStoredKdf(passphrase, blob.kdf);
+  const iv = Buffer.from(blob.iv, 'base64');
+  const tag = Buffer.from(blob.tag, 'base64');
+  const ciphertext = Buffer.from(blob.ciphertext, 'base64');
+  const expectedMac = createHmac('sha256', key)
+    .update(iv)
+    .update(tag)
+    .update(ciphertext)
+    .digest('base64');
+  if (expectedMac !== blob.mac) {
+    throw new Error('KeyVault authentication failed');
+  }
+
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return JSON.parse(plaintext.toString('utf8'));
+}
+
 class KeyVault {
   constructor({ storageDir, filename = 'securechat.keys.enc' }) {
     if (!storageDir) {
@@ -76,33 +124,10 @@ class KeyVault {
     if (!identityPrivateKey || !devicePrivateKey) {
       throw new Error('KeyVault requires both identityPrivateKey and devicePrivateKey');
     }
-    const salt = randomBytes(16);
-    const { key, kdf } = deriveKey(passphrase, salt, options);
-    const iv = randomBytes(12);
-
-    const plaintext = Buffer.from(JSON.stringify({
+    const payload = encryptBlobWithPassphrase({
       identityPrivateKey,
       devicePrivateKey,
-    }));
-
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    const mac = createHmac('sha256', key)
-      .update(iv)
-      .update(tag)
-      .update(ciphertext)
-      .digest('base64');
-
-    const payload = {
-      schemaVersion: KEY_VAULT_SCHEMA_VERSION,
-      kdf,
-      iv: iv.toString('base64'),
-      tag: tag.toString('base64'),
-      ciphertext: ciphertext.toString('base64'),
-      mac,
-      updatedAt: Date.now(),
-    };
+    }, passphrase, options);
 
     fs.mkdirSync(this.storageDir, { recursive: true });
     const tmpPath = `${this.filePath}.tmp`;
@@ -114,28 +139,7 @@ class KeyVault {
   unlock(passphrase) {
     const raw = fs.readFileSync(this.filePath, 'utf8');
     const payload = JSON.parse(raw);
-    if (payload.schemaVersion !== KEY_VAULT_SCHEMA_VERSION) {
-      throw new Error('KeyVault unsupported schema version');
-    }
-
-    const key = deriveKeyFromStoredKdf(passphrase, payload.kdf);
-    const iv = Buffer.from(payload.iv, 'base64');
-    const tag = Buffer.from(payload.tag, 'base64');
-    const ciphertext = Buffer.from(payload.ciphertext, 'base64');
-
-    const expectedMac = createHmac('sha256', key)
-      .update(iv)
-      .update(tag)
-      .update(ciphertext)
-      .digest('base64');
-    if (expectedMac !== payload.mac) {
-      throw new Error('KeyVault authentication failed');
-    }
-
-    const decipher = createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(tag);
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    const parsed = JSON.parse(plaintext.toString('utf8'));
+    const parsed = decryptBlobWithPassphrase(payload, passphrase);
 
     this.unlockedKeys = {
       identityPrivateKey: parsed.identityPrivateKey,
@@ -171,4 +175,6 @@ class KeyVault {
 module.exports = {
   KeyVault,
   KEY_VAULT_SCHEMA_VERSION,
+  encryptBlobWithPassphrase,
+  decryptBlobWithPassphrase,
 };

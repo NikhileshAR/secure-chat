@@ -1,0 +1,19 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "maxConnections": 1000,
+  "maxBufferedBytes": 524288,
+  "maxMessageSizeBytes": 65536,
+  "rateLimits": {
+    "connection": { "windowMs": 1000, "maxMessages": 300 },
+    "device": { "windowMs": 1000, "maxMessages": 120 },
+    "routeTag": { "windowMs": 1000, "maxMessages": 200 }
+  },
+  "relayBatchSize": 50,
+  "shuffleDelivery": true,
+  "logLevel": "minimal",
+  "enableMetrics": true,
+  "ephemeralMode": true,
+  "securityProfile": "BALANCED",
+  "strictWireMode": true
+}
