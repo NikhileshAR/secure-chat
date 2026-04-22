@@ -1,0 +1,29 @@
+{
+  "name": "handshake-basic-v1",
+  "input": {
+    "type": "handshake",
+    "protocolVersion": "1.0",
+    "senderDeviceId": "alice-device",
+    "timestamp": 1710000000000,
+    "encryptedPayload": "",
+    "identityPublicKey": "identity-key",
+    "devicePublicKey": "device-key",
+    "deviceKeySignature": "sig",
+    "supportedVersions": [
+      "1.0"
+    ]
+  },
+  "encoded_base64": "eyJkZXZpY2VLZXlTaWduYXR1cmUiOiJzaWciLCJkZXZpY2VQdWJsaWNLZXkiOiJkZXZpY2Uta2V5IiwiZW5jcnlwdGVkUGF5bG9hZCI6IiIsImlkZW50aXR5UHVibGljS2V5IjoiaWRlbnRpdHkta2V5IiwicHJvdG9jb2xWZXJzaW9uIjoiMS4wIiwic2VuZGVyRGV2aWNlSWQiOiJhbGljZS1kZXZpY2UiLCJzdXBwb3J0ZWRWZXJzaW9ucyI6WyIxLjAiXSwidGltZXN0YW1wIjoxNzEwMDAwMDAwMDAwLCJ0eXBlIjoiaGFuZHNoYWtlIn0=",
+  "hash": "fc9ee564b2930952f2c1d370665f357366ca34256885f17e9c97ffd764e9ceb5",
+  "expected_fields": [
+    "type",
+    "protocolVersion",
+    "senderDeviceId",
+    "timestamp",
+    "encryptedPayload",
+    "identityPublicKey",
+    "devicePublicKey",
+    "deviceKeySignature",
+    "supportedVersions"
+  ]
+}
