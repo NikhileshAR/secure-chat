@@ -100,6 +100,14 @@ const OPSEC_MODES = {
   HARDENED: 'HARDENED',
 };
 const DEFAULT_KEY_VAULT_AUTO_LOCK_TIMEOUT_MS = 60_000;
+const HANDSHAKE_STATES = {
+  NONE: 'NONE',
+  INITIATED: 'INITIATED',
+  COMPLETE: 'COMPLETE',
+};
+const DEFAULT_HANDSHAKE_RETRY_INTERVAL_MS = 2_000;
+const DEFAULT_MAX_HANDSHAKE_ATTEMPTS = 8;
+const DEFAULT_RELIABLE_PULL_MAX_BACKOFF_MS = 12_000;
 
 function encodeBackupValue(value) {
   if (Buffer.isBuffer(value)) {
@@ -215,6 +223,11 @@ class SecureClient {
     maxActiveSessions = 512,
     relayRegistry,
     relaySelectionStrategy = 'FIXED',
+    enforceReadySession = false,
+    debugDelivery = false,
+    handshakeRetryIntervalMs = DEFAULT_HANDSHAKE_RETRY_INTERVAL_MS,
+    maxHandshakeAttempts = DEFAULT_MAX_HANDSHAKE_ATTEMPTS,
+    reliablePullMaxBackoffMs = DEFAULT_RELIABLE_PULL_MAX_BACKOFF_MS,
   }) {
     const rawConfig = {
       mode: process.env.NODE_ENV,
@@ -319,6 +332,14 @@ class SecureClient {
     this.maxActiveSessions = Math.max(4, Number(maxActiveSessions) || 512);
     this.relaySelectionStrategy = String(relaySelectionStrategy || 'FIXED').toUpperCase();
     this.relayRegistry = relayRegistry || new RelayRegistry();
+    this.enforceReadySession = Boolean(enforceReadySession);
+    this.debugDelivery = Boolean(debugDelivery || process.env.DEBUG_DELIVERY === '1');
+    this.handshakeRetryIntervalMs = Math.max(250, Number(handshakeRetryIntervalMs) || DEFAULT_HANDSHAKE_RETRY_INTERVAL_MS);
+    this.maxHandshakeAttempts = Math.max(1, Number(maxHandshakeAttempts) || DEFAULT_MAX_HANDSHAKE_ATTEMPTS);
+    this.reliablePullMaxBackoffMs = Math.max(
+      1_000,
+      Number(reliablePullMaxBackoffMs) || DEFAULT_RELIABLE_PULL_MAX_BACKOFF_MS,
+    );
 
     const minMessagesPerSecond = Number(effectiveRateShaping?.minMessagesPerSecond);
     const maxMessagesPerSecond = Number(effectiveRateShaping?.maxMessagesPerSecond);
@@ -394,6 +415,10 @@ class SecureClient {
     this.keyVault = keyVault || (keyVaultStorageDir ? new KeyVault({ storageDir: keyVaultStorageDir }) : null);
     this.keyVaultAutoLockTimeoutMs = Math.max(1_000, Number(keyVaultAutoLockTimeoutMs) || DEFAULT_KEY_VAULT_AUTO_LOCK_TIMEOUT_MS);
     this.keyVaultAutoLockTimer = null;
+    this.pendingReadySessions = new Map();
+    this.pendingSessionMessages = [];
+    this.pendingSessionRetryTimer = null;
+    this.reliablePullState = null;
     this.trustStore = trustStore || ((trustStoreStorageDir || sessionStorageDir) && deviceSecret
       ? new TrustStore({
         storageDir: trustStoreStorageDir || sessionStorageDir,
@@ -432,6 +457,8 @@ class SecureClient {
             if (session.skippedMessageKeys instanceof Map) {
               session.skippedMessageKeys.clear();
             }
+            session.handshakeState = HANDSHAKE_STATES.COMPLETE;
+            session.isReady = true;
           }
         }
       }
@@ -452,6 +479,13 @@ class SecureClient {
 
   appendSecurityEvent(type, details = {}) {
     this.securityLog.append(type, details);
+  }
+
+  debugDeliveryLog(event, details = {}) {
+    if (!this.debugDelivery) {
+      return;
+    }
+    console.log(`[securechat:delivery] ${event}`, details);
   }
 
   assertProtocolInvariant(name, condition, details = {}) {
@@ -928,6 +962,8 @@ class SecureClient {
     }
     this.startAckRetryLoop();
     this.startCoverTraffic();
+    this.retryPendingSessionMessages();
+    this.triggerImmediateReliablePull();
     this.relayRegistry.markSeen(this.serverUrl);
   }
 
@@ -1095,6 +1131,12 @@ class SecureClient {
       ) {
         this.sessions.delete(sessionId);
       } else {
+        if (!existing.handshakeState) {
+          existing.handshakeState = HANDSHAKE_STATES.COMPLETE;
+        }
+        if (typeof existing.isReady !== 'boolean') {
+          existing.isReady = existing.handshakeState === HANDSHAKE_STATES.COMPLETE;
+        }
         if (typeof existing.lastActivityAt === 'number' && now - existing.lastActivityAt > this.longInactivityMs) {
           existing.ratchetPending = true;
           existing.forceRatchetOnNextSend = true;
@@ -1136,14 +1178,286 @@ class SecureClient {
       forceRatchetOnNextSend: false,
       expiresAt: now + this.sessionTtlMs,
       lastActivityAt: now,
+      handshakeState: this.enforceReadySession ? HANDSHAKE_STATES.NONE : HANDSHAKE_STATES.COMPLETE,
+      isReady: !this.enforceReadySession,
+      handshakeAttempts: 0,
+      lastHandshakeAt: 0,
       isDecoy: typeof peerDeviceId === 'string' && peerDeviceId.startsWith(DECOY_SESSION_PREFIX),
       preferredRelayUrl: this.selectRelay()?.url || this.serverUrl || null,
     };
 
     this.sessions.set(sessionId, session);
+    this.debugDeliveryLog('session_created', {
+      sessionId,
+      peerDeviceId,
+      handshakeState: session.handshakeState,
+      isReady: session.isReady,
+    });
     this.pruneActiveSessions();
     this.persistSessions();
     return session;
+  }
+
+  markSessionHandshakeState(sessionId, state) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return null;
+    }
+    session.handshakeState = state;
+    session.isReady = state === HANDSHAKE_STATES.COMPLETE;
+    if (session.isReady) {
+      session.handshakeAttempts = 0;
+      this.resolveSessionReady(sessionId, session);
+      this.flushPendingMessagesForSession(sessionId);
+    }
+    this.persistSessions();
+    this.debugDeliveryLog('handshake_state', {
+      sessionId,
+      state: session.handshakeState,
+      isReady: session.isReady,
+    });
+    return session;
+  }
+
+  resolveSessionReady(sessionId, session) {
+    const waiters = this.pendingReadySessions.get(sessionId) || [];
+    this.pendingReadySessions.delete(sessionId);
+    for (const waiter of waiters) {
+      waiter.resolve(session);
+    }
+  }
+
+  rejectSessionReady(sessionId, error) {
+    const waiters = this.pendingReadySessions.get(sessionId) || [];
+    this.pendingReadySessions.delete(sessionId);
+    for (const waiter of waiters) {
+      waiter.reject(error);
+    }
+  }
+
+  queuePendingSessionMessage(entry) {
+    const queued = {
+      ...entry,
+      queuedAt: Date.now(),
+      retries: entry.retries || 0,
+      nextAttemptAt: Date.now(),
+    };
+    this.pendingSessionMessages.push(queued);
+    this.schedulePendingSessionRetry(0);
+    return queued;
+  }
+
+  schedulePendingSessionRetry(delayMs = this.handshakeRetryIntervalMs) {
+    if (this.pendingSessionRetryTimer) {
+      return;
+    }
+    this.pendingSessionRetryTimer = setTimeout(() => {
+      this.pendingSessionRetryTimer = null;
+      this.retryPendingSessionMessages();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  retryPendingSessionMessages() {
+    if (!this.pendingSessionMessages.length) {
+      return;
+    }
+    const now = Date.now();
+    const pending = this.pendingSessionMessages.splice(0, this.pendingSessionMessages.length);
+    for (const item of pending) {
+      if (item.nextAttemptAt > now) {
+        this.pendingSessionMessages.push(item);
+        continue;
+      }
+      const sent = this.trySendChatImmediate(item.params, { bypassReadiness: false });
+      if (!sent) {
+        item.retries += 1;
+        item.nextAttemptAt = now + Math.min(
+          this.reliablePullMaxBackoffMs,
+          this.handshakeRetryIntervalMs * Math.max(1, item.retries),
+        );
+        this.pendingSessionMessages.push(item);
+      }
+    }
+    if (this.pendingSessionMessages.length) {
+      this.schedulePendingSessionRetry();
+    }
+  }
+
+  flushPendingMessagesForSession(sessionId) {
+    if (!this.pendingSessionMessages.length) {
+      return;
+    }
+    const remaining = [];
+    for (const entry of this.pendingSessionMessages) {
+      if (entry.sessionId !== sessionId) {
+        remaining.push(entry);
+        continue;
+      }
+      const sent = this.trySendChatImmediate(entry.params, { bypassReadiness: true });
+      if (!sent) {
+        remaining.push(entry);
+      }
+    }
+    this.pendingSessionMessages = remaining;
+    if (this.pendingSessionMessages.length) {
+      this.schedulePendingSessionRetry();
+    }
+  }
+
+  createSessionHandshakeEnvelope({
+    peerDeviceId,
+    peerIdentityPublicKey,
+    peerDevicePublicKey,
+    routeSecret,
+    stage = 'init',
+  }) {
+    return {
+      type: 'handshake',
+      protocolVersion: this.protocolVersion,
+      senderDeviceId: this.identity.deviceId,
+      targetDeviceId: peerDeviceId,
+      timestamp: Date.now(),
+      encryptedPayload: JSON.stringify({
+        stage,
+        routeSecretHash: routeSecret
+          ? createHash('sha256').update(String(routeSecret)).digest('hex')
+          : null,
+      }),
+      identityPublicKey: this.identity.identityKeyPair.publicKey,
+      devicePublicKey: this.identity.deviceKeyPair.publicKey,
+      deviceKeySignature: this.identity.deviceKeySignature,
+      publicKeys: {
+        identity: this.identity.identityKeyPair.publicKey,
+        classicalDevice: this.identity.deviceKeyPair.publicKey,
+        postQuantumDevice: this.postQuantumPublicKey,
+      },
+      supportedVersions: this.supportedVersions,
+    };
+  }
+
+  initiateSessionHandshake({
+    peerDeviceId,
+    peerIdentityPublicKey,
+    peerDevicePublicKey,
+    routeSecret,
+  }) {
+    const sessionId = this.getSessionId({ peerDeviceId, peerDevicePublicKey, routeSecret });
+    const session = this.ensureSession({
+      peerDeviceId,
+      peerIdentityPublicKey,
+      peerDevicePublicKey,
+      routeSecret,
+    });
+    if (!this.enforceReadySession || session.isReady) {
+      return session;
+    }
+    const attempts = Number(session.handshakeAttempts || 0);
+    if (attempts >= this.maxHandshakeAttempts) {
+      const error = new Error(`Handshake failed for session ${sessionId}`);
+      this.rejectSessionReady(sessionId, error);
+      throw error;
+    }
+    session.handshakeAttempts = attempts + 1;
+    session.lastHandshakeAt = Date.now();
+    this.markSessionHandshakeState(sessionId, HANDSHAKE_STATES.INITIATED);
+    this.debugDeliveryLog('handshake_start', { sessionId, peerDeviceId, attempt: session.handshakeAttempts });
+    this.sendRaw(this.createSessionHandshakeEnvelope({
+      peerDeviceId,
+      peerIdentityPublicKey,
+      peerDevicePublicKey,
+      routeSecret,
+      stage: 'init',
+    }));
+    return session;
+  }
+
+  ensureSessionReady(identityPublicKey, devicePublicKey, options = {}) {
+    const {
+      peerDeviceId,
+      routeSecret,
+      timeoutMs = 15_000,
+    } = options || {};
+    const sessionId = this.getSessionId({
+      peerDeviceId,
+      peerDevicePublicKey: devicePublicKey,
+      routeSecret,
+    });
+    const session = this.ensureSession({
+      peerDeviceId,
+      peerIdentityPublicKey: identityPublicKey,
+      peerDevicePublicKey: devicePublicKey,
+      routeSecret,
+    });
+    if (!this.enforceReadySession || session.isReady) {
+      return Promise.resolve(session);
+    }
+    return new Promise((resolve, reject) => {
+      const waiters = this.pendingReadySessions.get(sessionId) || [];
+      waiters.push({ resolve, reject });
+      this.pendingReadySessions.set(sessionId, waiters);
+      const refreshed = this.sessions.get(sessionId);
+      if (refreshed?.isReady) {
+        this.resolveSessionReady(sessionId, refreshed);
+        return;
+      }
+      try {
+        const elapsed = Date.now() - Number(refreshed?.lastHandshakeAt || 0);
+        if (
+          refreshed?.handshakeState !== HANDSHAKE_STATES.INITIATED
+          || elapsed >= this.handshakeRetryIntervalMs
+        ) {
+          this.initiateSessionHandshake({
+            peerDeviceId,
+            peerIdentityPublicKey: identityPublicKey,
+            peerDevicePublicKey: devicePublicKey,
+            routeSecret,
+          });
+        }
+      } catch (error) {
+        this.rejectSessionReady(sessionId, error);
+        return;
+      }
+      if (timeoutMs > 0) {
+        setTimeout(() => {
+          const active = this.pendingReadySessions.get(sessionId) || [];
+          const index = active.findIndex((entry) => entry.resolve === resolve);
+          if (index >= 0) {
+            active.splice(index, 1);
+            if (active.length) {
+              this.pendingReadySessions.set(sessionId, active);
+            } else {
+              this.pendingReadySessions.delete(sessionId);
+            }
+            reject(new Error(`Session bootstrap timeout for ${sessionId}`));
+          }
+        }, timeoutMs);
+      }
+    });
+  }
+
+  getSessionReadiness({ peerDeviceId, peerDevicePublicKey, routeSecret } = {}) {
+    try {
+      const sessionId = this.getSessionId({ peerDeviceId, peerDevicePublicKey, routeSecret });
+      const session = this.sessions.get(sessionId);
+      if (!session) {
+        return {
+          exists: false,
+          handshakeState: HANDSHAKE_STATES.NONE,
+          isReady: false,
+        };
+      }
+      return {
+        exists: true,
+        handshakeState: session.handshakeState || HANDSHAKE_STATES.NONE,
+        isReady: Boolean(session.isReady),
+      };
+    } catch {
+      return {
+        exists: false,
+        handshakeState: HANDSHAKE_STATES.NONE,
+        isReady: false,
+      };
+    }
   }
 
   pruneActiveSessions() {
@@ -1249,6 +1563,66 @@ class SecureClient {
     return valid;
   }
 
+  parseHandshakePayload(message) {
+    if (!message?.encryptedPayload) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(message.encryptedPayload);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  handleHandshakeMessage({
+    message,
+    senderDevicePublicKey,
+    senderIdentityPublicKey,
+    routeSecret,
+  }) {
+    if (!this.isHandshakeValid(message)) {
+      return null;
+    }
+    const payload = this.parseHandshakePayload(message);
+    const stage = payload.stage === 'response' ? 'response' : 'init';
+    const session = this.ensureSession({
+      peerDeviceId: message.senderDeviceId,
+      peerIdentityPublicKey: senderIdentityPublicKey
+        || message.identityPublicKey
+        || message.publicKeys?.identity,
+      peerDevicePublicKey: senderDevicePublicKey
+        || message.devicePublicKey
+        || message.publicKeys?.classicalDevice,
+      routeSecret,
+    });
+    const sessionId = this.getSessionId({
+      peerDeviceId: message.senderDeviceId,
+      peerDevicePublicKey: senderDevicePublicKey || message.devicePublicKey,
+      routeSecret,
+    });
+    this.markSessionHandshakeState(sessionId, HANDSHAKE_STATES.COMPLETE);
+    this.debugDeliveryLog('handshake_complete', {
+      sessionId,
+      stage,
+      from: message.senderDeviceId,
+    });
+    if (stage === 'init') {
+      try {
+        this.sendRaw(this.createSessionHandshakeEnvelope({
+          peerDeviceId: message.senderDeviceId,
+          peerIdentityPublicKey: session.peerIdentityPublicKey,
+          peerDevicePublicKey: session.peerDevicePublicKey,
+          routeSecret,
+          stage: 'response',
+        }));
+      } catch {
+        // response will be retried on next session-ready demand
+      }
+    }
+    return session;
+  }
+
   maybeRatchetSendChain(session) {
     const now = Date.now();
     if (
@@ -1297,6 +1671,17 @@ class SecureClient {
     }
   }
 
+  trySendChatImmediate(params, { bypassReadiness = false } = {}) {
+    try {
+      return this.sendChat({
+        ...params,
+        __bypassReadiness: bypassReadiness,
+      });
+    } catch {
+      return null;
+    }
+  }
+
   sendChat({
     content,
     recipientDevicePublicKey,
@@ -1304,6 +1689,7 @@ class SecureClient {
     recipientIdentityPublicKey,
     routeSecret,
     attachments,
+    __bypassReadiness = false,
   }) {
     if (this.safeMode) {
       this.queueDummyForTrafficSlot();
@@ -1312,12 +1698,37 @@ class SecureClient {
       });
       return null;
     }
+    const sessionId = this.getSessionId({
+      peerDeviceId: recipientDeviceId,
+      peerDevicePublicKey: recipientDevicePublicKey,
+      routeSecret,
+    });
     const session = this.ensureSession({
       peerDeviceId: recipientDeviceId,
       peerIdentityPublicKey: recipientIdentityPublicKey,
       peerDevicePublicKey: recipientDevicePublicKey,
       routeSecret,
     });
+    if (this.enforceReadySession && !__bypassReadiness && (!session || !session.isReady)) {
+      this.queuePendingSessionMessage({
+        sessionId,
+        params: {
+          content,
+          recipientDevicePublicKey,
+          recipientDeviceId,
+          recipientIdentityPublicKey,
+          routeSecret,
+          attachments,
+        },
+      });
+      this.ensureSessionReady(recipientIdentityPublicKey, recipientDevicePublicKey, {
+        peerDeviceId: recipientDeviceId,
+        routeSecret,
+      }).catch(() => {
+        this.schedulePendingSessionRetry();
+      });
+      return null;
+    }
 
     this.maybeRatchetSendChain(session);
 
@@ -1353,8 +1764,15 @@ class SecureClient {
 
     const signature = signMessage(this.identity.identityKeyPair.privateKey, baseMessage);
     const envelope = { ...baseMessage, signature };
-    this.queueOutboundMessage(envelope, { sessionId: this.getSessionId({ peerDeviceId: recipientDeviceId, peerDevicePublicKey: recipientDevicePublicKey, routeSecret }) });
+    this.queueOutboundMessage(envelope, { sessionId });
     this.trackAck(envelope);
+    this.triggerImmediateReliablePull();
+    this.debugDeliveryLog('message_send', {
+      messageId,
+      targetDeviceId: recipientDeviceId,
+      routeTag,
+      sessionId,
+    });
     if (this.opsecMode === OPSEC_MODES.HARDENED && this.keyVault && !this.keyVault.isLocked()) {
       this.keyVault.clearUnlockedKeys();
     }
@@ -1442,10 +1860,15 @@ class SecureClient {
     }
 
     for (const entry of ready) {
-      this.sendRaw(entry.message);
-      const index = this.outboundQueue.findIndex((candidate) => candidate.sequence === entry.sequence);
-      if (index >= 0) {
-        this.outboundQueue.splice(index, 1);
+      try {
+        this.sendRaw(entry.message);
+        const index = this.outboundQueue.findIndex((candidate) => candidate.sequence === entry.sequence);
+        if (index >= 0) {
+          this.outboundQueue.splice(index, 1);
+        }
+      } catch {
+        entry.releaseAt = Date.now() + this.handshakeRetryIntervalMs;
+        entry.retries = (entry.retries || 0) + 1;
       }
     }
     this.lastOutboundSentAt = Date.now();
@@ -1791,6 +2214,14 @@ class SecureClient {
         peerDevicePublicKey: senderDevicePublicKey,
         routeSecret,
       });
+      if (this.enforceReadySession && !session.isReady) {
+        const sessionId = this.getSessionId({
+          peerDeviceId: normalizedMessage.senderDeviceId,
+          peerDevicePublicKey: senderDevicePublicKey,
+          routeSecret,
+        });
+        this.markSessionHandshakeState(sessionId, HANDSHAKE_STATES.COMPLETE);
+      }
 
       this.pruneSeenMessageIds(session.seenMessageIds);
       if (session.seenMessageIds.has(normalizedMessage.messageId)) {
@@ -1805,6 +2236,12 @@ class SecureClient {
       const routeTagMatches = expectedRouteTags.includes(normalizedMessage.routeTag);
       if (!routeTagMatches) {
         this.incrementSecurityMetric('routeTagMismatches');
+        this.debugDeliveryLog('route_tag_mismatch', {
+          messageId: normalizedMessage.messageId,
+          routeTag: normalizedMessage.routeTag,
+          expectedRouteTags,
+        });
+        return null;
       }
       this.assertProtocolInvariant(
         'route_tag_derived_match',
@@ -1836,9 +2273,18 @@ class SecureClient {
         return null;
       }
       this.acknowledgeDelivery(normalizedMessage);
+      this.debugDeliveryLog('decrypt_success', {
+        messageId: normalizedMessage.messageId,
+        senderDeviceId: normalizedMessage.senderDeviceId,
+      });
       return payload;
     } catch (error) {
       this.incrementSecurityMetric('messageFailures');
+      this.debugDeliveryLog('decrypt_failure', {
+        messageId: normalizedMessage?.messageId,
+        senderDeviceId: normalizedMessage?.senderDeviceId,
+        error: error.message,
+      });
       this.appendSecurityEvent('protocol_violation', {
         message: error.message,
         senderDeviceId: normalizedMessage.senderDeviceId,
@@ -1886,7 +2332,25 @@ class SecureClient {
       this.receiveAck(normalized);
       return null;
     }
+    if (normalized.type === 'handshake') {
+      return this.handleHandshakeMessage({ ...params, message: normalized });
+    }
     if (normalized.type === 'chat') {
+      const deviceIdMatches = !normalized.targetDeviceId || normalized.targetDeviceId === this.identity.deviceId;
+      this.debugDeliveryLog('device_id_match', {
+        messageId: normalized.messageId,
+        targetDeviceId: normalized.targetDeviceId,
+        localDeviceId: this.identity.deviceId,
+        matches: deviceIdMatches,
+      });
+      if (!deviceIdMatches) {
+        return null;
+      }
+      this.debugDeliveryLog('message_receive', {
+        messageId: normalized.messageId,
+        routeTag: normalized.routeTag,
+        targetDeviceId: normalized.targetDeviceId,
+      });
       return this.decryptChat({ ...params, message: normalized });
     }
     return null;
@@ -1901,6 +2365,28 @@ class SecureClient {
     const routeTags = [];
     for (const routeSecret of effectiveRouteSecrets) {
       const session = this.ensureSession({ routeSecret, peerDeviceId: `_route_session:${routeSecret}` });
+      const start = Math.max(0, session.receiveCounter - boundedWindow);
+      const end = session.receiveCounter + boundedWindow;
+      for (let counter = start; counter <= end; counter += 1) {
+        const routeTagEpoch = this.deriveRouteTagEpochForCounter(session, counter);
+        for (let index = 0; index < this.parallelRouteTags; index += 1) {
+          routeTags.push(computeRouteTag(session.rootKey, counter, 'send', index, routeTagEpoch));
+          if (routeTags.length >= this.maxPullRouteTags) {
+            break;
+          }
+        }
+        if (routeTags.length >= this.maxPullRouteTags) {
+          break;
+        }
+      }
+      if (routeTags.length >= this.maxPullRouteTags) {
+        break;
+      }
+    }
+    for (const session of this.sessions.values()) {
+      if (!session?.rootKey || !session?.isReady || session.isDecoy) {
+        continue;
+      }
       const start = Math.max(0, session.receiveCounter - boundedWindow);
       const end = session.receiveCounter + boundedWindow;
       for (let counter = start; counter <= end; counter += 1) {
@@ -1947,6 +2433,10 @@ class SecureClient {
       ));
     }
     const normalizedTags = shuffleInPlace(routeTags).slice(0, pullTargetCount);
+    this.debugDeliveryLog('pull_route_tags', {
+      routeTagCount: normalizedTags.length,
+      sample: normalizedTags.slice(0, 5),
+    });
 
     this.sendRaw({
       type: 'control',
@@ -1956,6 +2446,76 @@ class SecureClient {
       action: 'pull',
       routeTags: normalizedTags,
     });
+  }
+
+  startReliablePullLoop(routeSecrets = [], { intervalMs = 2_000, window = this.receiveWindow } = {}) {
+    if (this.safeMode) {
+      return;
+    }
+    this.stopReliablePullLoop();
+    this.ensureDecoySessions();
+    this.reliablePullState = {
+      routeSecrets: [...routeSecrets],
+      window,
+      baseIntervalMs: Math.max(0, Number(intervalMs) || 0),
+      failures: 0,
+      active: true,
+      timer: null,
+    };
+    this.autoPullActive = true;
+    this.autoPullRouteSecrets = [...routeSecrets];
+    this.autoPullBaseIntervalMs = Math.max(0, Number(intervalMs) || 0);
+    const schedule = () => {
+      if (!this.reliablePullState?.active) {
+        return;
+      }
+      const jitter = this.pullIntervalJitterMs > 0
+        ? randomInt(-this.pullIntervalJitterMs, this.pullIntervalJitterMs + 1)
+        : 0;
+      const hardenedJitter = this.opsecMode === OPSEC_MODES.HARDENED
+        ? randomInt(-100, 101)
+        : 0;
+      const backoff = Math.min(
+        this.reliablePullMaxBackoffMs,
+        this.reliablePullState.baseIntervalMs * (2 ** this.reliablePullState.failures),
+      );
+      const nextInterval = Math.max(0, backoff + jitter + hardenedJitter);
+      this.reliablePullState.timer = setTimeout(() => {
+        this.reliablePullState.timer = null;
+        try {
+          this.pull(this.reliablePullState.routeSecrets, { window: this.reliablePullState.window });
+          this.reliablePullState.failures = 0;
+        } catch {
+          this.reliablePullState.failures = Math.min(10, this.reliablePullState.failures + 1);
+        }
+        schedule();
+      }, nextInterval);
+    };
+    schedule();
+  }
+
+  triggerImmediateReliablePull() {
+    if (!this.reliablePullState?.active) {
+      return;
+    }
+    try {
+      this.pull(this.reliablePullState.routeSecrets, { window: this.reliablePullState.window });
+      this.reliablePullState.failures = 0;
+    } catch {
+      this.reliablePullState.failures = Math.min(10, this.reliablePullState.failures + 1);
+    }
+  }
+
+  stopReliablePullLoop() {
+    if (!this.reliablePullState) {
+      return;
+    }
+    this.reliablePullState.active = false;
+    if (this.reliablePullState.timer) {
+      clearTimeout(this.reliablePullState.timer);
+      this.reliablePullState.timer = null;
+    }
+    this.reliablePullState = null;
   }
 
   startAutoPull(routeSecrets = [], { intervalMs = 2_000, window = this.receiveWindow } = {}) {
@@ -2442,7 +3002,12 @@ class SecureClient {
     }
     this.stopCoverTraffic();
     this.stopAutoPull();
+    this.stopReliablePullLoop();
     this.stopAckRetryLoop();
+    if (this.pendingSessionRetryTimer) {
+      clearTimeout(this.pendingSessionRetryTimer);
+      this.pendingSessionRetryTimer = null;
+    }
     if (this.keyVaultAutoLockTimer) {
       clearTimeout(this.keyVaultAutoLockTimer);
       this.keyVaultAutoLockTimer = null;

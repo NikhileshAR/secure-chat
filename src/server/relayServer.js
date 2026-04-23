@@ -28,6 +28,7 @@ class RelayServer {
     enableMetrics = false,
     relayFlushBaseDelayMs = 4,
     relayFlushJitterMs = 12,
+    debugDelivery = false,
   } = {}) {
     this.host = host;
     this.port = port;
@@ -49,6 +50,7 @@ class RelayServer {
     this.enableMetrics = Boolean(enableMetrics);
     this.relayFlushBaseDelayMs = Math.max(0, Number(relayFlushBaseDelayMs) || 0);
     this.relayFlushJitterMs = Math.max(0, Number(relayFlushJitterMs) || 0);
+    this.debugDelivery = Boolean(debugDelivery || process.env.DEBUG_DELIVERY === '1');
 
     this.connections = new Map();
     this.routeStore = new Map();
@@ -68,6 +70,13 @@ class RelayServer {
       droppedBySoftRateLimit: 0,
       droppedInvalidMessages: 0,
     };
+  }
+
+  debugDeliveryLog(event, details = {}) {
+    if (!this.debugDelivery) {
+      return;
+    }
+    console.log(`[relay:delivery] ${event}`, details);
   }
 
   start() {
@@ -187,6 +196,18 @@ class RelayServer {
 
       if (message.type === 'handshake') {
         this.connections.set(message.senderDeviceId, socket);
+        this.debugDeliveryLog('handshake_received', {
+          senderDeviceId: message.senderDeviceId,
+          targetDeviceId: message.targetDeviceId,
+        });
+        const target = message.targetDeviceId && this.connections.get(message.targetDeviceId);
+        if (target && target.readyState === target.OPEN) {
+          if (target.bufferedAmount > this.maxBufferedBytes) {
+            target.close();
+            continue;
+          }
+          target.send(`${JSON.stringify(message)}\n`);
+        }
         continue;
       }
 
@@ -214,14 +235,28 @@ class RelayServer {
         }
 
         this.storeChatByRouteTag(message);
+        this.debugDeliveryLog('route_tag_received', {
+          routeTag: message.routeTag,
+          messageId: message.messageId,
+          targetDeviceId: message.targetDeviceId,
+        });
 
         const target = message.targetDeviceId && this.connections.get(message.targetDeviceId);
         if (target && target.readyState === target.OPEN) {
+          this.debugDeliveryLog('device_id_match', {
+            targetDeviceId: message.targetDeviceId,
+            matched: true,
+          });
           if (target.bufferedAmount > this.maxBufferedBytes) {
             target.close();
             continue;
           }
           target.send(`${JSON.stringify(message)}\n`);
+        } else {
+          this.debugDeliveryLog('device_id_match', {
+            targetDeviceId: message.targetDeviceId,
+            matched: false,
+          });
         }
         continue;
       }
@@ -261,6 +296,7 @@ class RelayServer {
     const matches = [];
     for (const routeTag of routeTags) {
       const stored = this.routeStore.get(routeTag) || [];
+      this.debugDeliveryLog('pull_route_tag_received', { routeTag, count: stored.length });
       for (const entry of stored) {
         if (entry.expiresAt > Date.now()) {
           matches.push(JSON.parse(entry.payload));

@@ -95,11 +95,13 @@ const ProtocolSpec = {
         'deviceKeySignature',
         'publicKeys',
         'supportedVersions',
+        'targetDeviceId',
       ],
       fieldTypes: {
         type: 'string',
         protocolVersion: 'string',
         senderDeviceId: 'string',
+        targetDeviceId: 'string',
         timestamp: 'number',
         encryptedPayload: 'string',
         identityPublicKey: 'string',
@@ -110,6 +112,7 @@ const ProtocolSpec = {
       },
       maxLengths: {
         senderDeviceId: 512,
+        targetDeviceId: 512,
         supportedVersions: 16,
       },
       normalize: (message) => normalizeHandshake(baseNormalize(message)),

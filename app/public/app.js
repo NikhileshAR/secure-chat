@@ -126,18 +126,46 @@ if (typeof window !== 'undefined') {
     const active = connection.activeRelayUrl || 'n/a';
     const fallback = relays.find((url) => url !== connection.activeRelayUrl) || 'n/a';
     byId('relayStatus').textContent = `Connected to: ${active} (fallback: ${fallback})`;
+    updateSendAvailability();
   }
 
   function renderContactInfo(contact) {
     const block = byId('contactInfo');
     if (!contact) {
       block.classList.add('hidden');
+      updateSendAvailability();
       return;
     }
     block.classList.remove('hidden');
     byId('contactFingerprint').textContent = contact.fingerprint;
     byId('contactTrust').textContent = contact.trustLevel;
     byId('contactShortId').textContent = contact.shortId || APP_HELPERS.shortIdFromFingerprint(contact.fingerprint);
+    byId('sessionStatus').textContent = contact.session?.label
+      || (state.connection?.status === 'CONNECTED' ? 'Establishing secure session...' : 'Connecting...');
+    updateSendAvailability();
+  }
+
+  function updateSendAvailability() {
+    const sendBtn = byId('sendBtn');
+    const selected = state.contacts.find((contact) => contact.id === state.selectedContactId) || null;
+    const ready = Boolean(
+      selected
+      && selected.session?.isReady
+      && state.connection?.status === 'CONNECTED',
+    );
+    sendBtn.disabled = !ready;
+    if (!selected) {
+      byId('sessionStatus').textContent = state.connection?.status === 'CONNECTED'
+        ? 'Establishing secure session...'
+        : 'Connecting...';
+      return;
+    }
+    if (ready) {
+      byId('sessionStatus').textContent = 'Secure session ready';
+      return;
+    }
+    byId('sessionStatus').textContent = selected.session?.label
+      || (state.connection?.status === 'CONNECTED' ? 'Establishing secure session...' : 'Connecting...');
   }
 
   function renderContacts(contacts) {
@@ -166,6 +194,7 @@ if (typeof window !== 'undefined') {
     } else {
       renderContactInfo(null);
     }
+    updateSendAvailability();
   }
 
   function renderMessages(contactId) {
@@ -371,6 +400,7 @@ if (typeof window !== 'undefined') {
       state.selectedContactId = byId('chatContactSelect').value || null;
       const selected = state.contacts.find((contact) => contact.id === state.selectedContactId) || null;
       renderContactInfo(selected);
+      updateSendAvailability();
       refreshCurrentMessages().catch(() => {
         renderMessages(state.selectedContactId);
       });

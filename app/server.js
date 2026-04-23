@@ -238,6 +238,8 @@ class InstanceManager {
     ctx.client = new SecureClient({
       serverUrl: ctx.state.relays[0],
       relaySelectionStrategy: 'ROTATE',
+      enforceReadySession: true,
+      debugDelivery: process.env.DEBUG_DELIVERY === '1',
       sessionStorageDir: ctx.paths.clientStoreDir,
       trustStoreStorageDir: ctx.paths.clientStoreDir,
       keyVaultStorageDir: ctx.paths.clientStoreDir,
@@ -270,7 +272,44 @@ class InstanceManager {
       ...contact,
       trustLevel: activeClient.getTrustLevel(contact.identityPublicKey) || 'UNKNOWN',
       shortId: shortIdFromFingerprint(contact.fingerprint),
+      session: this.getContactSessionState(ctx, contact),
     }));
+  }
+
+  isContactBootstrapComplete(contact) {
+    return Boolean(
+      contact
+      && contact.identityPublicKey
+      && contact.devicePublicKey
+      && contact.deviceId
+      && contact.routeSecret,
+    );
+  }
+
+  getContactSessionState(ctx, contact) {
+    if (!this.isContactBootstrapComplete(contact)) {
+      return {
+        exists: false,
+        isReady: false,
+        handshakeState: 'NONE',
+        label: 'Establishing secure session...',
+      };
+    }
+    const activeClient = this.ensureClient(ctx);
+    const readiness = activeClient.getSessionReadiness({
+      peerDeviceId: contact.deviceId,
+      peerDevicePublicKey: contact.devicePublicKey,
+      routeSecret: contact.routeSecret,
+    });
+    const label = !ctx.state.connected
+      ? 'Connecting...'
+      : readiness.isReady
+        ? 'Secure session ready'
+        : 'Establishing secure session...';
+    return {
+      ...readiness,
+      label,
+    };
   }
 
   listMessagesForContact(ctx, contactId) {
@@ -332,6 +371,24 @@ class InstanceManager {
     return false;
   }
 
+  ingestHandshakeMessage(ctx, message) {
+    const activeClient = this.ensureClient(ctx);
+    for (const contact of this.contactCandidatesForMessage(ctx, message)) {
+      try {
+        activeClient.handleInboundMessage({
+          message,
+          senderIdentityPublicKey: contact.identityPublicKey,
+          senderDevicePublicKey: contact.devicePublicKey || undefined,
+          routeSecret: contact.routeSecret,
+        });
+        return true;
+      } catch {
+        // try next contact candidate
+      }
+    }
+    return false;
+  }
+
   processInboundEnvelope(ctx, envelope) {
     if (!envelope || typeof envelope !== 'object') {
       return;
@@ -370,6 +427,11 @@ class InstanceManager {
 
     if (envelope.type === 'chat') {
       this.ingestChatMessage(ctx, envelope);
+      return;
+    }
+
+    if (envelope.type === 'handshake') {
+      this.ingestHandshakeMessage(ctx, envelope);
     }
   }
 
@@ -411,6 +473,9 @@ class InstanceManager {
       ctx.state.connected = false;
       ctx.state.connectionStatus = 'DISCONNECTED';
       ctx.state.activeRelayUrl = null;
+       if (ctx.client) {
+        ctx.client.stopReliablePullLoop();
+      }
       this.scheduleReconnect(ctx);
     });
 
@@ -418,6 +483,9 @@ class InstanceManager {
       ctx.state.connected = false;
       ctx.state.connectionStatus = 'ERROR';
       ctx.state.lastError = error?.message || 'relay socket error';
+      if (ctx.client) {
+        ctx.client.stopReliablePullLoop();
+      }
       this.scheduleReconnect(ctx);
     });
   }
@@ -460,26 +528,16 @@ class InstanceManager {
   }
 
   schedulePollLoop(ctx) {
-    if (ctx.pollTimer) {
-      clearTimeout(ctx.pollTimer);
+    const activeClient = this.ensureClient(ctx);
+    const routeSecrets = [...new Set([...ctx.state.contacts.values()].map((contact) => contact.routeSecret).filter(Boolean))];
+    if (!ctx.state.connected) {
+      activeClient.stopReliablePullLoop();
+      return;
     }
-
-    const run = () => {
-      if (ctx.state.connected && ctx.client) {
-        const routeSecrets = [...new Set([...ctx.state.contacts.values()].map((contact) => contact.routeSecret).filter(Boolean))];
-        if (routeSecrets.length) {
-          try {
-            ctx.client.pull(routeSecrets, { window: ctx.client.receiveWindow });
-          } catch {
-            // keep polling loop alive
-          }
-        }
-      }
-      const jitterMs = 1500 + Math.floor(Math.random() * 2500);
-      ctx.pollTimer = setTimeout(run, jitterMs);
-    };
-
-    run();
+    activeClient.startReliablePullLoop(routeSecrets, {
+      intervalMs: 2_000 + Math.floor(Math.random() * 1_500),
+      window: activeClient.receiveWindow,
+    });
   }
 
   setRelays(ctx, inputUrls) {
@@ -529,23 +587,28 @@ class InstanceManager {
     if (!parsed || typeof parsed !== 'object') {
       throw new Error('Invalid contact payload');
     }
-    if (!parsed.identityPublicKey || !parsed.fingerprint) {
-      throw new Error('Contact payload must include identityPublicKey and fingerprint');
+    if (
+      !parsed.identityPublicKey
+      || !parsed.devicePublicKey
+      || !parsed.deviceId
+      || !parsed.routeSecret
+    ) {
+      throw new Error('Contact payload must include identityPublicKey, devicePublicKey, deviceId, and routeSecret');
     }
 
     const normalizedFingerprint = formatIdentityFingerprint(parsed.identityPublicKey);
-    if (normalizedFingerprint !== parsed.fingerprint) {
+    if (parsed.fingerprint && normalizedFingerprint !== parsed.fingerprint) {
       throw new Error('Fingerprint does not match identity public key');
     }
 
     return {
       identityPublicKey: parsed.identityPublicKey,
-      fingerprint: parsed.fingerprint,
+      fingerprint: normalizedFingerprint,
       relayUrl: parsed.relayUrl || null,
       deviceName: parseDeviceName(parsed.deviceName) || null,
-      deviceId: parsed.deviceId || null,
-      devicePublicKey: parsed.devicePublicKey || null,
-      routeSecret: parsed.routeSecret || randomRouteSecret(),
+      deviceId: parsed.deviceId,
+      devicePublicKey: parsed.devicePublicKey,
+      routeSecret: parsed.routeSecret,
     };
   }
 
@@ -572,6 +635,7 @@ class InstanceManager {
       this.setRelays(ctx, [...ctx.state.relays, parsed.relayUrl]);
     }
     activeClient.trustIdentity(contact.identityPublicKey, contact.label);
+    this.schedulePollLoop(ctx);
     this.persistState(ctx);
 
     return {
@@ -745,6 +809,10 @@ function createAppServer() {
           sendJson(res, 400, { error: 'Not connected to relay' });
           return;
         }
+        if (!manager.isContactBootstrapComplete(contact)) {
+          sendJson(res, 400, { error: 'Contact is missing required bootstrap fields' });
+          return;
+        }
 
         const envelope = activeClient.sendChat({
           content: String(body.content || ''),
@@ -757,7 +825,7 @@ function createAppServer() {
         const outbound = {
           id: envelope?.messageId || randomBytes(8).toString('hex'),
           direction: 'out',
-          status: 'sent',
+          status: envelope ? 'sent' : 'queued',
           senderIdentityPublicKey: activeClient.identity.identityKeyPair.publicKey,
           senderDeviceId: activeClient.identity.deviceId,
           senderLabel: context.state.deviceName,
@@ -766,6 +834,7 @@ function createAppServer() {
         };
 
         manager.pushMessage(context, contact.id, outbound);
+        manager.schedulePollLoop(context);
         sendJson(res, 200, { ok: true, message: outbound });
         return;
       }
