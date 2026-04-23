@@ -83,6 +83,8 @@ const DEFAULT_MIXING_DELAY_RANGE_MS = { min: 0, max: 0 };
 const DEFAULT_INBOUND_DELAY_RANGE_MS = { min: 5, max: 35 };
 const DEFAULT_SMOOTHING_WINDOW_MS = 5_000;
 const DEFAULT_SMOOTHING_VARIANCE = 0.15;
+const ROUTE_SESSION_PREFIX = '_route_ref:';
+const LEGACY_ROUTE_SESSION_PREFIX = '_route_session:';
 const DECOY_SESSION_PREFIX = '_decoy_session:';
 const DEFAULT_LONG_INACTIVITY_MS = 10 * 60_000;
 const DEFAULT_MAX_QUARANTINE_MESSAGES = 128;
@@ -276,6 +278,7 @@ class SecureClient {
     this.maxPullRouteTags = maxPullRouteTags;
     this.sessionTtlMs = sessionTtlMs;
     this.sessions = new Map();
+    this.routeSessionMap = new Map();
     this.knownPeerIdentities = new Map();
     this.securityProfile = safeConfig.securityProfile;
     this.opsecMode = effectiveOpsecMode;
@@ -449,8 +452,30 @@ class SecureClient {
       if (loaded instanceof Map) {
         this.sessions = loaded;
         const now = Date.now();
-        for (const session of this.sessions.values()) {
+        for (const [sessionId, session] of [...this.sessions.entries()]) {
+          let effectiveSessionId = sessionId;
+          if (typeof sessionId === 'string' && sessionId.startsWith(LEGACY_ROUTE_SESSION_PREFIX)) {
+            const legacyRouteSecret = sessionId.slice(LEGACY_ROUTE_SESSION_PREFIX.length);
+            const migratedId = this.getOpaqueRouteSessionId(legacyRouteSecret);
+            if (!this.sessions.has(migratedId)) {
+              this.sessions.set(migratedId, session);
+            }
+            this.sessions.delete(sessionId);
+            effectiveSessionId = migratedId;
+            if (!session.routeSecretRef) {
+              session.routeSecretRef = this.getRouteSessionRef(legacyRouteSecret);
+            }
+          }
           if (session && typeof session === 'object') {
+            if (
+              typeof session.peerDeviceId === 'string'
+              && session.peerDeviceId.startsWith(LEGACY_ROUTE_SESSION_PREFIX)
+            ) {
+              session.peerDeviceId = undefined;
+            }
+            if (!session.routeSecretRef && typeof effectiveSessionId === 'string' && effectiveSessionId.startsWith(ROUTE_SESSION_PREFIX)) {
+              session.routeSecretRef = effectiveSessionId.slice(ROUTE_SESSION_PREFIX.length);
+            }
             session.ratchetPending = true;
             session.forceRatchetOnNextSend = true;
             session.lastActivityAt = now;
@@ -459,11 +484,13 @@ class SecureClient {
             }
             session.handshakeState = HANDSHAKE_STATES.COMPLETE;
             session.isReady = true;
+            this.indexRouteSession(effectiveSessionId, session);
           }
         }
       }
     } catch (error) {
       this.sessions = new Map();
+      this.routeSessionMap = new Map();
       if (process.env.SECURECHAT_DEBUG_PERSISTENCE === '1') {
         console.warn('SecureClient: failed to load persisted sessions:', error.message);
       }
@@ -1055,9 +1082,77 @@ class SecureClient {
       return peerDevicePublicKey;
     }
     if (routeSecret) {
-      return `_route_session:${routeSecret}`;
+      return this.getRouteMappedSessionId(routeSecret);
     }
     throw new Error('peerDeviceId, peerDevicePublicKey or routeSecret is required');
+  }
+
+  getRouteSessionRef(routeSecret) {
+    return createHash('sha256')
+      .update(`route-session:${String(routeSecret)}`)
+      .digest('hex');
+  }
+
+  getOpaqueRouteSessionId(routeSecret) {
+    return `${ROUTE_SESSION_PREFIX}${this.getRouteSessionRef(routeSecret)}`;
+  }
+
+  getRouteMappedSessionId(routeSecret) {
+    const routeSecretRef = this.getRouteSessionRef(routeSecret);
+    return this.routeSessionMap.get(routeSecretRef) || `${ROUTE_SESSION_PREFIX}${routeSecretRef}`;
+  }
+
+  isRouteOnlySessionId(sessionId) {
+    return typeof sessionId === 'string' && sessionId.startsWith(ROUTE_SESSION_PREFIX);
+  }
+
+  indexRouteSession(sessionId, session) {
+    if (!session?.routeSecretRef) {
+      return;
+    }
+    const mapped = this.routeSessionMap.get(session.routeSecretRef);
+    if (
+      !mapped
+      || mapped === sessionId
+      || (this.isRouteOnlySessionId(mapped) && !this.isRouteOnlySessionId(sessionId))
+      || (this.isRouteOnlySessionId(mapped) && this.isRouteOnlySessionId(sessionId))
+    ) {
+      this.routeSessionMap.set(session.routeSecretRef, sessionId);
+    }
+  }
+
+  remapPendingSessionReferences(fromSessionId, toSessionId) {
+    if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) {
+      return;
+    }
+    const fromReady = this.pendingReadySessions.get(fromSessionId);
+    if (fromReady?.length) {
+      const toReady = this.pendingReadySessions.get(toSessionId) || [];
+      this.pendingReadySessions.set(toSessionId, [...toReady, ...fromReady]);
+      this.pendingReadySessions.delete(fromSessionId);
+    }
+    for (const entry of this.pendingSessionMessages) {
+      if (entry.sessionId === fromSessionId) {
+        entry.sessionId = toSessionId;
+      }
+    }
+  }
+
+  remapSessionId(fromSessionId, toSessionId, updates = {}) {
+    if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) {
+      return this.sessions.get(toSessionId) || null;
+    }
+    const existing = this.sessions.get(fromSessionId);
+    if (!existing || this.sessions.has(toSessionId)) {
+      return this.sessions.get(toSessionId) || existing || null;
+    }
+    this.sessions.delete(fromSessionId);
+    this.sessions.set(toSessionId, {
+      ...existing,
+      ...updates,
+    });
+    this.remapPendingSessionReferences(fromSessionId, toSessionId);
+    return this.sessions.get(toSessionId);
   }
 
   isInitiatorForPeer(peerDeviceId, peerDevicePublicKey) {
@@ -1109,7 +1204,25 @@ class SecureClient {
 
   ensureSession({ peerDeviceId, peerIdentityPublicKey, peerDevicePublicKey, routeSecret }) {
     const sessionId = this.getSessionId({ peerDeviceId, peerDevicePublicKey, routeSecret });
+    const routeSecretRef = routeSecret ? this.getRouteSessionRef(routeSecret) : undefined;
     const now = Date.now();
+
+    if (routeSecretRef && peerDeviceId) {
+      const mappedSessionId = this.routeSessionMap.get(routeSecretRef);
+      if (
+        mappedSessionId
+        && mappedSessionId !== sessionId
+        && this.isRouteOnlySessionId(mappedSessionId)
+        && !this.sessions.has(sessionId)
+      ) {
+        this.remapSessionId(mappedSessionId, sessionId, {
+          peerDeviceId,
+          peerIdentityPublicKey,
+          peerDevicePublicKey,
+          routeSecretRef,
+        });
+      }
+    }
 
     if (peerIdentityPublicKey && peerDeviceId) {
       this.rememberPeerIdentity(peerDeviceId, peerIdentityPublicKey);
@@ -1130,10 +1243,14 @@ class SecureClient {
         && peerDevicePublicKey !== existing.peerDevicePublicKey
       ) {
         this.sessions.delete(sessionId);
-      } else {
-        if (!existing.handshakeState) {
-          existing.handshakeState = HANDSHAKE_STATES.COMPLETE;
-        }
+        } else {
+          if (routeSecretRef) {
+            existing.routeSecretRef = routeSecretRef;
+            this.indexRouteSession(sessionId, existing);
+          }
+          if (!existing.handshakeState) {
+            existing.handshakeState = HANDSHAKE_STATES.COMPLETE;
+          }
         if (typeof existing.isReady !== 'boolean') {
           existing.isReady = existing.handshakeState === HANDSHAKE_STATES.COMPLETE;
         }
@@ -1163,6 +1280,7 @@ class SecureClient {
       peerDeviceId,
       peerIdentityPublicKey,
       peerDevicePublicKey,
+      routeSecretRef,
       rootKey: Buffer.from(initial.rootKey),
       chainKeySend: Buffer.from(initial.chainKeySend),
       chainKeyReceive: Buffer.from(initial.chainKeyReceive),
@@ -1187,6 +1305,7 @@ class SecureClient {
     };
 
     this.sessions.set(sessionId, session);
+    this.indexRouteSession(sessionId, session);
     this.debugDeliveryLog('session_created', {
       sessionId,
       peerDeviceId,
@@ -2364,7 +2483,7 @@ class SecureClient {
     const effectiveRouteSecrets = [...new Set([...routeSecrets, ...this.decoyRouteSecrets])];
     const routeTags = [];
     for (const routeSecret of effectiveRouteSecrets) {
-      const session = this.ensureSession({ routeSecret, peerDeviceId: `_route_session:${routeSecret}` });
+      const session = this.ensureSession({ routeSecret });
       const start = Math.max(0, session.receiveCounter - boundedWindow);
       const end = session.receiveCounter + boundedWindow;
       for (let counter = start; counter <= end; counter += 1) {
@@ -2410,7 +2529,6 @@ class SecureClient {
     if (effectiveRouteSecrets.length) {
       const referenceSession = this.ensureSession({
         routeSecret: effectiveRouteSecrets[0],
-        peerDeviceId: `_route_session:${effectiveRouteSecrets[0]}`,
       });
       referenceCounter = referenceSession.receiveCounter;
     }
